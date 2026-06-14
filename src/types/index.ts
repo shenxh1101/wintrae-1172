@@ -126,6 +126,26 @@ export interface Holiday {
   description?: string;
 }
 
+export type RuleHitType = 'status' | 'expired' | 'holiday' | 'exception' | 'schedule' | 'conflict';
+
+export interface AvailabilityHitRule {
+  ruleType: RuleHitType;
+  ruleName: string;
+  description: string;
+  blocksAvailability: boolean;
+  alternativeWindow?: string;
+  ruleSource?: any;
+}
+
+export interface AvailabilityDetail {
+  available: boolean;
+  reason?: string;
+  ruleType?: RuleHitType;
+  alternativeWindow?: string;
+  hitRules: AvailabilityHitRule[];
+  fullReason: string;
+}
+
 export type AuditLogActionType =
   | 'equipment.status.change'
   | 'equipment.schedule.update'
@@ -135,6 +155,7 @@ export type AuditLogActionType =
   | 'holiday.add'
   | 'holiday.remove'
   | 'reservation.batch.submit'
+  | 'reservation.batch.retry'
   | 'reservation.approve'
   | 'reservation.reject'
   | 'reservation.cancel'
@@ -149,6 +170,10 @@ export interface AuditLog {
   targetId?: string;
   targetName?: string;
   detail: string;
+  before?: Record<string, any>;
+  after?: Record<string, any>;
+  result?: 'success' | 'failed' | 'partial';
+  resultDetail?: string;
   createdAt: string;
 }
 

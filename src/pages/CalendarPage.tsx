@@ -13,6 +13,9 @@ import {
   RefreshCw,
   Edit3,
   Save,
+  AlertTriangle,
+  Eye,
+  Search,
 } from 'lucide-react';
 import { format, addDays, eachDayOfInterval, parseISO } from 'date-fns';
 import { zhCN } from 'date-fns/locale';
@@ -20,7 +23,7 @@ import { useAppStore } from '@/store/useAppStore';
 import WeekCalendar from '@/components/WeekCalendar';
 import Modal from '@/components/Modal';
 import StatusBadge from '@/components/StatusBadge';
-import type { Equipment } from '@/types';
+import type { Equipment, AvailabilityDetail } from '@/types';
 
 interface BatchResult {
   success: Array<{
@@ -40,7 +43,20 @@ interface BatchResult {
     startTime: string;
     endTime: string;
     reason: string;
+    detail?: AvailabilityDetail;
   }>;
+}
+
+interface PreflightItem {
+  tempId: string;
+  equipmentId: string;
+  equipmentName: string;
+  date: string;
+  isoDate: string;
+  startTime: string;
+  endTime: string;
+  detail?: AvailabilityDetail;
+  checked: boolean;
 }
 
 interface EquipmentDateMap {
@@ -61,6 +77,7 @@ export default function CalendarPage() {
     getReservationsByEquipment,
     isSlotAvailable,
     isWithinOperatingHours,
+    getEquipmentAvailabilityDetail,
     addAuditLog,
   } = useAppStore();
 
@@ -73,6 +90,7 @@ export default function CalendarPage() {
   const [participants, setParticipants] = useState('');
   const [remark, setRemark] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isPreflighting, setIsPreflighting] = useState(false);
   const [batchResult, setBatchResult] = useState<BatchResult>({ success: [], failed: [] });
 
   // 批量模式相关状态
@@ -85,6 +103,10 @@ export default function CalendarPage() {
   // 多设备模式下每台设备的自定义日期
   const [equipmentDates, setEquipmentDates] = useState<EquipmentDateMap>({});
   const [batchError, setBatchError] = useState('');
+
+  // 预检清单
+  const [showPreflightModal, setShowPreflightModal] = useState(false);
+  const [preflightItems, setPreflightItems] = useState<PreflightItem[]>([]);
 
   // 重试弹窗相关状态
   const [retryingItem, setRetryingItem] = useState<BatchResult['failed'][0] | null>(null);
@@ -221,7 +243,179 @@ export default function CalendarPage() {
 
   const handleBatchSubmit = () => {
     if (!validateBatch()) return;
-    setShowConfirmModal(true);
+    runPreflight();
+  };
+
+  const runPreflight = () => {
+    setIsPreflighting(true);
+    setBatchError('');
+
+    const [startH, startM] = batchStartTime.split(':').map(Number);
+    const [endH, endM] = batchEndTime.split(':').map(Number);
+
+    let items: Array<{ equipment: Equipment; date: Date }> = [];
+
+    if (batchMode === 'multi-equipment') {
+      for (const equipment of batchEquipments) {
+        const dateStr = equipmentDates[equipment.id];
+        if (dateStr) {
+          items.push({ equipment, date: parseISO(dateStr) });
+        }
+      }
+    } else {
+      const defaultEquipment = selectedEquipment || availableEquipments[0];
+      if (defaultEquipment) {
+        const days = eachDayOfInterval({
+          start: parseISO(batchStartDate),
+          end: parseISO(batchEndDate),
+        });
+        items = days.map((date) => ({ equipment: defaultEquipment, date }));
+      }
+    }
+
+    const preflightList: PreflightItem[] = [];
+    let tempIdCounter = 0;
+
+    items.forEach(({ equipment, date }) => {
+      tempIdCounter++;
+      const isoDate = format(date, 'yyyy-MM-dd');
+      const detail = getEquipmentAvailabilityDetail(
+        equipment.id,
+        isoDate,
+        batchStartTime,
+        batchEndTime
+      );
+
+      preflightList.push({
+        tempId: `pre-${tempIdCounter}`,
+        equipmentId: equipment.id,
+        equipmentName: equipment.name,
+        date: format(date, 'MM月dd日'),
+        isoDate,
+        startTime: batchStartTime,
+        endTime: batchEndTime,
+        detail,
+        checked: detail.available,
+      });
+    });
+
+    setPreflightItems(preflightList);
+    setIsPreflighting(false);
+    setShowPreflightModal(true);
+  };
+
+  const togglePreflightItem = (tempId: string) => {
+    setPreflightItems((prev) =>
+      prev.map((item) =>
+        item.tempId === tempId ? { ...item, checked: !item.checked } : item
+      )
+    );
+  };
+
+  const updatePreflightItemDate = (tempId: string, date: string) => {
+    setPreflightItems((prev) =>
+      prev.map((item) => {
+        if (item.tempId !== tempId) return item;
+        const isoDate = date;
+        const detail = getEquipmentAvailabilityDetail(
+          item.equipmentId,
+          isoDate,
+          item.startTime,
+          item.endTime
+        );
+        return {
+          ...item,
+          isoDate,
+          date: format(parseISO(date), 'MM月dd日'),
+          detail,
+          checked: detail.available,
+        };
+      })
+    );
+  };
+
+  const submitFromPreflight = () => {
+    const itemsToSubmit = preflightItems.filter((item) => item.checked);
+    if (itemsToSubmit.length === 0) {
+      setBatchError('请至少勾选一条可预约的条目');
+      return;
+    }
+
+    setIsSubmitting(true);
+    setShowPreflightModal(false);
+
+    const result: BatchResult = { success: [], failed: [] };
+
+    itemsToSubmit.forEach((item) => {
+      const start = new Date(parseISO(item.isoDate));
+      const [sh, sm] = item.startTime.split(':').map(Number);
+      const [eh, em] = item.endTime.split(':').map(Number);
+      start.setHours(sh, sm, 0, 0);
+      const end = new Date(parseISO(item.isoDate));
+      end.setHours(eh, em, 0, 0);
+
+      if (
+        !isWithinOperatingHours(item.equipmentId, start.toISOString(), end.toISOString()) ||
+        !isSlotAvailable(item.equipmentId, start.toISOString(), end.toISOString())
+      ) {
+        result.failed.push({
+          tempId: item.tempId,
+          equipmentId: item.equipmentId,
+          equipmentName: item.equipmentName,
+          date: item.date,
+          time: `${item.startTime} - ${item.endTime}`,
+          isoDate: item.isoDate,
+          startTime: item.startTime,
+          endTime: item.endTime,
+          reason: item.detail?.reason || '校验失败',
+          detail: item.detail,
+        });
+      } else {
+        const id = addReservation({
+          userId: currentUserId,
+          equipmentId: item.equipmentId,
+          startTime: start.toISOString(),
+          endTime: end.toISOString(),
+          purpose,
+          participants,
+        });
+        result.success.push({
+          id,
+          equipmentId: item.equipmentId,
+          equipmentName: item.equipmentName,
+          date: item.date,
+          time: `${item.startTime} - ${item.endTime}`,
+        });
+      }
+    });
+
+    setBatchResult(result);
+
+    // 失败项保留在预检清单中
+    if (result.failed.length > 0) {
+      const retained: PreflightItem[] = result.failed.map((f) => ({
+        tempId: f.tempId,
+        equipmentId: f.equipmentId,
+        equipmentName: f.equipmentName,
+        date: f.date,
+        isoDate: f.isoDate,
+        startTime: f.startTime,
+        endTime: f.endTime,
+        detail: f.detail,
+        checked: false,
+      }));
+      setPreflightItems(retained);
+    }
+
+    addAuditLog({
+      actionType: 'reservation.batch.submit',
+      detail: `批量预约提交（预检模式）：成功 ${result.success.length} 条，失败 ${result.failed.length} 条`,
+      result: result.failed.length === 0 ? 'success' : (result.success.length > 0 ? 'partial' : 'failed'),
+      resultDetail: `成功 ${result.success.length} / 共 ${itemsToSubmit.length} 条`,
+    });
+
+    setIsSubmitting(false);
+    setShowBatchSummaryModal(true);
   };
 
   const handleSingleSubmit = () => {
@@ -1090,8 +1284,8 @@ export default function CalendarPage() {
                   )}
 
                   <button onClick={handleBatchSubmit} className="w-full btn-primary btn-lg">
-                    <Layers className="w-4 h-4" />
-                    提交批量预约申请
+                    <Eye className="w-4 h-4" />
+                    生成排期预检清单
                   </button>
                 </div>
               </div>
@@ -1391,6 +1585,140 @@ export default function CalendarPage() {
             </div>
           </div>
         )}
+      </Modal>
+
+      {/* 排期预检清单弹窗 */}
+      <Modal
+        isOpen={showPreflightModal}
+        onClose={() => setShowPreflightModal(false)}
+        title="排期预检清单"
+        size="xl"
+      >
+        <div className="space-y-4">
+          <div className="p-4 bg-neutral-50 rounded-lg">
+            <p className="text-sm text-neutral-700">
+              以下是待创建的预约清单，系统已对每一条进行了规则校验。请确认无误后勾选并提交。
+              <span className="text-danger-600"> 失败项会保留在清单中，可修改日期后继续重试。</span>
+            </p>
+            <div className="flex gap-4 mt-2 text-xs">
+              <span className="flex items-center gap-1 text-success-600">
+                <CheckCircle2 className="w-3.5 h-3.5" /> 可预约：{preflightItems.filter((i) => i.detail?.available).length} 条
+              </span>
+              <span className="flex items-center gap-1 text-danger-600">
+                <XCircle className="w-3.5 h-3.5" /> 不可预约：{preflightItems.filter((i) => !i.detail?.available).length} 条
+              </span>
+            </div>
+          </div>
+
+          {batchError && (
+            <div className="p-3 bg-danger-50 border border-danger-200 rounded-lg">
+              <p className="text-sm text-danger-700">{batchError}</p>
+            </div>
+          )}
+
+          <div className="max-h-[450px] overflow-y-auto border border-neutral-200 rounded-lg divide-y divide-neutral-100">
+            {preflightItems.length === 0 ? (
+              <div className="p-8 text-center text-neutral-400">
+                <Search className="w-8 h-8 mx-auto mb-2 opacity-50" />
+                <p className="text-sm">暂无预检项</p>
+              </div>
+            ) : (
+              preflightItems.map((item) => {
+                const isOk = item.detail?.available;
+                return (
+                  <div key={item.tempId} className={`p-4 ${isOk ? 'bg-white' : 'bg-danger-50/40'}`}>
+                    <div className="flex items-start gap-3">
+                      <div className="flex-shrink-0 mt-0.5">
+                        <input
+                          type="checkbox"
+                          checked={item.checked}
+                          onChange={() => togglePreflightItem(item.tempId)}
+                          className="w-4 h-4 text-primary-600 rounded focus:ring-primary-500 border-neutral-300"
+                        />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          {isOk ? (
+                            <CheckCircle2 className="w-4 h-4 text-success-500 flex-shrink-0" />
+                          ) : (
+                            <XCircle className="w-4 h-4 text-danger-500 flex-shrink-0" />
+                          )}
+                          <p className="text-sm font-medium text-neutral-800">{item.equipmentName}</p>
+                          <span className="text-xs text-neutral-500">
+                            {item.date} · {item.startTime} - {item.endTime}
+                          </span>
+                        </div>
+
+                        {/* 命中规则展示 */}
+                        {item.detail?.hitRules && item.detail.hitRules.length > 0 && (
+                          <div className="mt-2 space-y-1">
+                            {item.detail.hitRules.map((rule, ridx) => (
+                              <div
+                                key={ridx}
+                                className={`text-xs px-2 py-1 rounded inline-flex items-center gap-1 mr-1.5 ${
+                                  rule.blocksAvailability
+                                    ? 'bg-danger-50 text-danger-600 border border-danger-200'
+                                    : 'bg-warning-50 text-warning-600 border border-warning-200'
+                                }`}
+                                title={rule.description}
+                              >
+                                {rule.blocksAvailability ? (
+                                  <XCircle className="w-3 h-3" />
+                                ) : (
+                                  <AlertTriangle className="w-3 h-3" />
+                                )}
+                                {rule.ruleName}：{rule.description.length > 30 ? rule.description.slice(0, 30) + '...' : rule.description}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+
+                        {!isOk && (
+                          <div className="mt-2 flex items-center gap-2">
+                            <label className="text-xs text-neutral-500 whitespace-nowrap">调整日期：</label>
+                            <input
+                              type="date"
+                              value={item.isoDate}
+                              onChange={(e) => updatePreflightItemDate(item.tempId, e.target.value)}
+                              className="input text-xs py-1 px-2 h-8"
+                            />
+                            {item.detail?.alternativeWindow && (
+                              <span className="text-xs text-success-600">
+                                建议时段：{item.detail.alternativeWindow}
+                              </span>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+
+          <div className="flex justify-between items-center pt-3 border-t border-neutral-100">
+            <div className="text-xs text-neutral-500">
+              共 {preflightItems.length} 条，已勾选 {preflightItems.filter((i) => i.checked).length} 条
+            </div>
+            <div className="flex gap-3">
+              <button
+                onClick={() => setShowPreflightModal(false)}
+                className="btn-secondary"
+              >
+                取消
+              </button>
+              <button
+                onClick={submitFromPreflight}
+                disabled={isSubmitting || preflightItems.filter((i) => i.checked).length === 0}
+                className="btn-primary"
+              >
+                <CheckCircle2 className="w-4 h-4" />
+                {isSubmitting ? '提交中...' : `确认提交 ${preflightItems.filter((i) => i.checked).length} 条`}
+              </button>
+            </div>
+          </div>
+        </div>
       </Modal>
     </div>
   );

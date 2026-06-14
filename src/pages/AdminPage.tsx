@@ -20,6 +20,7 @@ import {
   Settings,
   CalendarOff,
   Calendar,
+  CalendarDays,
   RefreshCw,
   List,
   ClipboardList,
@@ -27,6 +28,11 @@ import {
   History,
   FileText,
   AlertCircle,
+  ChevronRight,
+  CheckCircle2,
+  AlertTriangle,
+  Info,
+  Save,
 } from 'lucide-react';
 import { format, startOfMonth, endOfMonth, eachDayOfInterval, parseISO, isToday, startOfDay, endOfDay, isWithinInterval } from 'date-fns';
 import { zhCN } from 'date-fns/locale';
@@ -57,6 +63,9 @@ export default function AdminPage() {
     getEquipmentById,
     getUserById,
     getScheduleByEquipment,
+    getDayAvailabilityDetail,
+    getAlternativeSlots,
+    getEquipmentAvailabilityDetail,
     approveReservation,
     rejectReservation,
     toggleUserBlacklist,
@@ -69,6 +78,7 @@ export default function AdminPage() {
     addHoliday,
     removeHoliday,
     resetToDefault,
+    modifyReservation,
   } = useAppStore();
 
   const [activeSection, setActiveSection] = useState('review');
@@ -84,6 +94,11 @@ export default function AdminPage() {
   const [notifEndDate, setNotifEndDate] = useState('');
   const [viewingReservation, setViewingReservation] = useState<string | null>(null);
   const [logFilter, setLogFilter] = useState<AuditLogActionType | 'all'>('all');
+  const [expandedLogId, setExpandedLogId] = useState<string | null>(null);
+  const [showModifyModal, setShowModifyModal] = useState(false);
+  const [modifyStartTime, setModifyStartTime] = useState('');
+  const [modifyEndTime, setModifyEndTime] = useState('');
+  const [modifyError, setModifyError] = useState('');
 
   // 时间表编辑弹窗
   const [showScheduleModal, setShowScheduleModal] = useState(false);
@@ -289,6 +304,7 @@ export default function AdminPage() {
     'reservation.cancel': '预约取消',
     'reservation.modify': '预约修改',
     'reservation.batch.submit': '批量预约提交',
+    'reservation.batch.retry': '批量预约重试',
     'user.blacklist.toggle': '用户黑名单',
   };
 
@@ -305,6 +321,7 @@ export default function AdminPage() {
     'reservation.cancel': 'bg-neutral-50 text-neutral-700 border-neutral-200',
     'reservation.modify': 'bg-primary-50 text-primary-700 border-primary-200',
     'reservation.batch.submit': 'bg-primary-50 text-primary-700 border-primary-200',
+    'reservation.batch.retry': 'bg-warning-50 text-warning-700 border-warning-200',
     'user.blacklist.toggle': 'bg-danger-50 text-danger-700 border-danger-200',
   };
 
@@ -334,6 +351,59 @@ export default function AdminPage() {
     if (logFilter === 'all') return auditLogs;
     return auditLogs.filter((l) => l.actionType === logFilter);
   }, [auditLogs, logFilter]);
+
+  const formatSnapshot = (obj?: Record<string, any>): string => {
+    if (!obj) return '无';
+    const parts: string[] = [];
+    const statusMap: Record<string, string> = {
+      'available': '正常开放',
+      'in-use': '使用中',
+      'maintenance': '维护中',
+      'disabled': '已停用',
+      'pending': '待审核',
+      'approved': '已通过',
+      'rejected': '已驳回',
+      'cancelled': '已取消',
+      'checked-in': '使用中',
+      'completed': '已完成',
+    };
+    Object.keys(obj).forEach((key) => {
+      let val = obj[key];
+      if (typeof val === 'string' && val.includes('T') && val.includes('Z')) {
+        try { val = format(new Date(val), 'MM-dd HH:mm', { locale: zhCN }); } catch {}
+      }
+      if (key === 'status' && typeof val === 'string' && statusMap[val]) {
+        val = statusMap[val];
+      }
+      if (key === 'isBlacklisted') {
+        val = val ? '已拉黑' : '正常';
+      }
+      const labelMap: Record<string, string> = {
+        status: '状态', startTime: '开始时间', endTime: '结束时间',
+        purpose: '实验目的', participants: '参与人员',
+        reviewComment: '审核意见', isBlacklisted: '黑名单',
+        blacklistReason: '拉黑原因',
+      };
+      parts.push(`${labelMap[key] || key}: ${val || '空'}`);
+    });
+    return parts.length > 0 ? parts.join(' | ') : '无';
+  };
+
+  const resultBadge = (result?: string) => {
+    const colors: Record<string, string> = {
+      success: 'bg-success-50 text-success-700 border-success-200',
+      failed: 'bg-danger-50 text-danger-700 border-danger-200',
+      partial: 'bg-warning-50 text-warning-700 border-warning-200',
+    };
+    const labels: Record<string, string> = {
+      success: '成功', failed: '失败', partial: '部分成功',
+    };
+    return result ? (
+      <span className={`inline-flex px-2 py-0.5 rounded-full text-xs border ${colors[result] || 'bg-neutral-50 text-neutral-700 border-neutral-200'}`}>
+        {labels[result] || result}
+      </span>
+    ) : null;
+  };
 
   const handleApprove = (id: string) => {
     approveReservation(id, '预约已通过，请按时使用。');
@@ -422,6 +492,29 @@ export default function AdminPage() {
     : null;
   const viewingEq = viewingRes ? getEquipmentById(viewingRes.equipmentId) : null;
   const viewingUser = viewingRes ? getUserById(viewingRes.userId) : null;
+
+  // 审核时查看当天设备占用情况
+  const {
+    dayDetail,
+    dayReservations,
+    alternativeSlots,
+  } = useMemo(() => {
+    if (!viewingRes || !viewingEq) {
+      return { dayDetail: null, dayReservations: [], alternativeSlots: [] };
+    }
+    const dateStr = format(new Date(viewingRes.startTime), 'yyyy-MM-dd');
+    const detail = getDayAvailabilityDetail(viewingEq.id, dateStr);
+    const dayRes = reservations.filter((r) => {
+      if (r.equipmentId !== viewingEq.id) return false;
+      if (r.status === 'cancelled' || r.status === 'rejected') return false;
+      if (r.id === viewingRes.id) return false;
+      const rDate = format(new Date(r.startTime), 'yyyy-MM-dd');
+      return rDate === dateStr;
+    });
+    const [currStart] = viewingRes.startTime.split('T')[1].split(':');
+    const slots = getAlternativeSlots(viewingEq.id, dateStr, `${currStart}:00`, 3);
+    return { dayDetail: detail, dayReservations: dayRes, alternativeSlots: slots };
+  }, [viewingRes, viewingEq, reservations, getDayAvailabilityDetail, getAlternativeSlots]);
 
   const renderContent = () => {
     switch (activeSection) {
@@ -1122,11 +1215,15 @@ export default function AdminPage() {
                 <table className="w-full">
                   <thead className="bg-neutral-50">
                     <tr>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase w-[10px]"></th>
                       <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase">
                         操作时间
                       </th>
                       <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase">
                         操作类型
+                      </th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase">
+                        结果
                       </th>
                       <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase">
                         操作人
@@ -1142,37 +1239,79 @@ export default function AdminPage() {
                   <tbody className="divide-y divide-neutral-100">
                     {filteredLogs.length === 0 && (
                       <tr>
-                        <td colSpan={5} className="px-4 py-16 text-center text-neutral-400">
+                        <td colSpan={7} className="px-4 py-16 text-center text-neutral-400">
                           <FileText className="w-10 h-10 mx-auto mb-2 opacity-50" />
                           <p className="text-sm">暂无操作日志</p>
                         </td>
                       </tr>
                     )}
-                    {filteredLogs.map((log) => (
-                      <tr key={log.id} className="hover:bg-neutral-50 transition-colors">
-                        <td className="px-4 py-3 text-sm text-neutral-600 whitespace-nowrap">
-                          {format(new Date(log.createdAt), 'yyyy-MM-dd HH:mm:ss', {
-                            locale: zhCN,
-                          })}
-                        </td>
-                        <td className="px-4 py-3">
-                          <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs border ${logActionColor[log.actionType]}`}>
-                            {logActionLabel[log.actionType]}
-                          </span>
-                        </td>
-                        <td className="px-4 py-3 text-sm text-neutral-700">
-                          {log.operatorName}
-                        </td>
-                        <td className="px-4 py-3 text-sm text-neutral-600">
-                          {log.targetName || log.targetId || '-'}
-                        </td>
-                        <td className="px-4 py-3 text-sm text-neutral-600 max-w-xs">
-                          <div className="truncate" title={log.detail}>
-                            {log.detail}
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
+                    {filteredLogs.map((log) => {
+                      const hasSnapshot = log.before || log.after;
+                      const isExpanded = expandedLogId === log.id;
+                      return (
+                        <>
+                          <tr className={`hover:bg-neutral-50 transition-colors ${isExpanded ? 'bg-neutral-50' : ''}`}>
+                            <td className="px-2 py-3">
+                              {hasSnapshot && (
+                                <button
+                                  onClick={() => setExpandedLogId(isExpanded ? null : log.id)}
+                                  className="p-1 rounded hover:bg-neutral-200 transition-colors"
+                                >
+                                  <ChevronRight className={`w-4 h-4 text-neutral-400 transition-transform ${isExpanded ? 'rotate-90' : ''}`} />
+                                </button>
+                              )}
+                            </td>
+                            <td className="px-4 py-3 text-sm text-neutral-600 whitespace-nowrap">
+                              {format(new Date(log.createdAt), 'yyyy-MM-dd HH:mm:ss', {
+                                locale: zhCN,
+                              })}
+                            </td>
+                            <td className="px-4 py-3">
+                              <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs border ${logActionColor[log.actionType]}`}>
+                                {logActionLabel[log.actionType]}
+                              </span>
+                            </td>
+                            <td className="px-4 py-3">{resultBadge(log.result)}</td>
+                            <td className="px-4 py-3 text-sm text-neutral-700">
+                              {log.operatorName}
+                            </td>
+                            <td className="px-4 py-3 text-sm text-neutral-600">
+                              {log.targetName || log.targetId || '-'}
+                            </td>
+                            <td className="px-4 py-3 text-sm text-neutral-600 max-w-xs">
+                              <div className="truncate" title={log.detail}>
+                                {log.detail}
+                              </div>
+                              {log.resultDetail && (
+                                <p className="text-xs text-neutral-400 mt-1" title={log.resultDetail}>
+                                  {log.resultDetail}
+                                </p>
+                              )}
+                            </td>
+                          </tr>
+                          {isExpanded && hasSnapshot && (
+                            <tr className="bg-neutral-50">
+                              <td colSpan={7} className="px-12 py-4">
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                  <div className="p-3 bg-neutral-100 rounded-lg">
+                                    <p className="text-xs font-medium text-neutral-500 mb-2">⏪ 变更前</p>
+                                    <p className="text-sm text-neutral-700 whitespace-pre-wrap font-mono">
+                                      {formatSnapshot(log.before)}
+                                    </p>
+                                  </div>
+                                  <div className="p-3 bg-success-50 rounded-lg">
+                                    <p className="text-xs font-medium text-success-600 mb-2">⏩ 变更后</p>
+                                    <p className="text-sm text-neutral-700 whitespace-pre-wrap font-mono">
+                                      {formatSnapshot(log.after)}
+                                    </p>
+                                  </div>
+                                </div>
+                              </td>
+                            </tr>
+                          )}
+                        </>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -1342,6 +1481,98 @@ export default function AdminPage() {
               </div>
             )}
 
+            {/* 当天设备规则占用情况 */}
+            {dayDetail && dayDetail.hitRules.length > 0 && (
+              <div className="p-4 bg-neutral-50 rounded-lg">
+                <div className="flex items-center gap-2 mb-3">
+                  <Info className="w-4 h-4 text-primary-500" />
+                  <p className="text-sm font-medium text-neutral-700">当日规则情况</p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {dayDetail.hitRules.map((rule, i) => (
+                    <span
+                      key={i}
+                      className={`text-xs px-2 py-1 rounded border ${
+                        rule.blocksAvailability
+                          ? 'bg-danger-50 text-danger-700 border-danger-200'
+                          : 'bg-primary-50 text-primary-700 border-primary-200'
+                      }`}
+                    >
+                      {rule.blocksAvailability ? (
+                        <XCircle className="w-3 h-3 inline mr-1" />
+                      ) : (
+                        <CheckCircle2 className="w-3 h-3 inline mr-1" />
+                      )}
+                      {rule.ruleName}：{rule.description}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* 当天其他预约占用 */}
+            <div className="p-4 bg-neutral-50 rounded-lg">
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-2">
+                  <CalendarDays className="w-4 h-4 text-primary-500" />
+                  <p className="text-sm font-medium text-neutral-700">
+                    {viewingRes && format(new Date(viewingRes.startTime), 'yyyy年MM月dd日')} 该设备其他预约
+                  </p>
+                </div>
+                <span className="text-xs text-neutral-500">共 {dayReservations.length} 条</span>
+              </div>
+              {dayReservations.length === 0 ? (
+                <p className="text-sm text-neutral-400">当日暂无其他预约</p>
+              ) : (
+                <div className="space-y-2 max-h-[160px] overflow-y-auto">
+                  {dayReservations.map((r) => {
+                    const u = getUserById(r.userId);
+                    return (
+                      <div key={r.id} className="p-3 bg-white rounded border border-neutral-200 flex items-center justify-between">
+                        <div>
+                          <p className="text-sm font-medium text-neutral-800">
+                            {format(new Date(r.startTime), 'HH:mm')} - {format(new Date(r.endTime), 'HH:mm')}
+                          </p>
+                          <p className="text-xs text-neutral-500">
+                            {u?.name || '未知用户'} · {r.purpose.slice(0, 20)}{r.purpose.length > 20 ? '...' : ''}
+                          </p>
+                        </div>
+                        <StatusBadge status={r.status} />
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* 可替代时间建议 */}
+            {viewingRes?.status === 'pending' && alternativeSlots.length > 0 && (
+              <div className="p-4 bg-success-50 rounded-lg border border-success-100">
+                <div className="flex items-center gap-2 mb-3">
+                  <RefreshCw className="w-4 h-4 text-success-500" />
+                  <p className="text-sm font-medium text-success-700">可替代时间建议</p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {alternativeSlots.map((slot, i) => (
+                    <button
+                      key={i}
+                      onClick={() => {
+                        setModifyStartTime(slot.startTime);
+                        setModifyEndTime(slot.endTime);
+                        setModifyError('');
+                        setShowModifyModal(true);
+                      }}
+                      className="btn-primary btn-sm text-xs"
+                    >
+                      <Clock className="w-3 h-3" />
+                      {slot.startTime} - {slot.endTime}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-xs text-success-600 mt-2">点击以上时段可直接修改预约时间</p>
+              </div>
+            )}
+
             <div className="flex justify-end gap-3 pt-2">
               <button
                 onClick={() => setViewingReservation(null)}
@@ -1373,6 +1604,128 @@ export default function AdminPage() {
                   </button>
                 </>
               )}
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      {/* 管理员调整预约时间弹窗 */}
+      <Modal
+        isOpen={showModifyModal}
+        onClose={() => {
+          setShowModifyModal(false);
+          setModifyError('');
+        }}
+        title="调整预约时间"
+      >
+        {viewingRes && (
+          <div className="space-y-4">
+            <div className="p-3 bg-neutral-50 rounded-lg">
+              <p className="text-sm font-medium text-neutral-800">
+                {viewingEq?.name}
+              </p>
+              <p className="text-xs text-neutral-500 mt-0.5">
+                原时间：{format(new Date(viewingRes.startTime), 'MM月dd日 HH:mm')} - {format(new Date(viewingRes.endTime), 'HH:mm')}
+              </p>
+            </div>
+
+            {modifyError && (
+              <div className="p-3 bg-danger-50 border border-danger-200 rounded-lg">
+                <p className="text-sm text-danger-700">{modifyError}</p>
+              </div>
+            )}
+
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-medium text-neutral-700 mb-1.5">
+                  开始时间
+                </label>
+                <input
+                  type="time"
+                  value={modifyStartTime}
+                  onChange={(e) => {
+                    setModifyStartTime(e.target.value);
+                    setModifyError('');
+                  }}
+                  className="input"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-neutral-700 mb-1.5">
+                  结束时间
+                </label>
+                <input
+                  type="time"
+                  value={modifyEndTime}
+                  onChange={(e) => {
+                    setModifyEndTime(e.target.value);
+                    setModifyError('');
+                  }}
+                  className="input"
+                />
+              </div>
+            </div>
+
+            <div className="p-3 bg-primary-50 rounded-lg">
+              <p className="text-xs text-primary-600">
+                <Info className="w-3 h-3 inline mr-1" />
+                修改后系统将重新校验该时段的开放规则和冲突，预约状态会变回待审核。
+              </p>
+            </div>
+
+            <div className="flex justify-end gap-3">
+              <button
+                onClick={() => {
+                  setShowModifyModal(false);
+                  setModifyError('');
+                }}
+                className="btn-secondary"
+              >
+                取消
+              </button>
+              <button
+                onClick={() => {
+                  if (!modifyStartTime || !modifyEndTime) {
+                    setModifyError('请填写完整的开始和结束时间');
+                    return;
+                  }
+                  if (modifyStartTime >= modifyEndTime) {
+                    setModifyError('结束时间必须晚于开始时间');
+                    return;
+                  }
+                  const dateStr = format(new Date(viewingRes.startTime), 'yyyy-MM-dd');
+                  const isoStart = `${dateStr}T${modifyStartTime}:00`;
+                  const isoEnd = `${dateStr}T${modifyEndTime}:00`;
+                  const detail = getEquipmentAvailabilityDetail(
+                    viewingRes.equipmentId,
+                    dateStr,
+                    modifyStartTime,
+                    modifyEndTime
+                  );
+                  if (!detail.available) {
+                    setModifyError(detail.reason || '该时段不符合预约规则');
+                    return;
+                  }
+                  const success = modifyReservation(
+                    viewingRes.id,
+                    isoStart,
+                    isoEnd,
+                    viewingRes.purpose,
+                    viewingRes.participants
+                  );
+                  if (success) {
+                    setShowModifyModal(false);
+                    setModifyError('');
+                    setViewingReservation(null);
+                  } else {
+                    setModifyError('修改失败，请检查时段是否可用');
+                  }
+                }}
+                className="btn-primary"
+              >
+                <Save className="w-4 h-4" />
+                确认修改
+              </button>
             </div>
           </div>
         )}
