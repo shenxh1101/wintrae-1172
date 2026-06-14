@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   CalendarDays,
@@ -10,6 +10,9 @@ import {
   ChevronRight,
   CalendarRange,
   Clock,
+  RefreshCw,
+  Edit3,
+  Save,
 } from 'lucide-react';
 import { format, addDays, eachDayOfInterval, parseISO } from 'date-fns';
 import { zhCN } from 'date-fns/locale';
@@ -28,12 +31,20 @@ interface BatchResult {
     time: string;
   }>;
   failed: Array<{
+    tempId: string;
     equipmentId: string;
     equipmentName: string;
     date: string;
     time: string;
+    isoDate: string;
+    startTime: string;
+    endTime: string;
     reason: string;
   }>;
+}
+
+interface EquipmentDateMap {
+  [equipmentId: string]: string;
 }
 
 export default function CalendarPage() {
@@ -50,12 +61,14 @@ export default function CalendarPage() {
     getReservationsByEquipment,
     isSlotAvailable,
     isWithinOperatingHours,
+    addAuditLog,
   } = useAppStore();
 
   const [mode, setMode] = useState<'single' | 'batch'>('single');
   const [selectedSlot, setSelectedSlot] = useState<{ start: Date; end: Date } | null>(null);
   const [showConfirmModal, setShowConfirmModal] = useState(false);
   const [showBatchSummaryModal, setShowBatchSummaryModal] = useState(false);
+  const [showRetryModal, setShowRetryModal] = useState(false);
   const [purpose, setPurpose] = useState('');
   const [participants, setParticipants] = useState('');
   const [remark, setRemark] = useState('');
@@ -69,7 +82,16 @@ export default function CalendarPage() {
   const [batchEndTime, setBatchEndTime] = useState('11:00');
   const [batchStartDate, setBatchStartDate] = useState(format(new Date(), 'yyyy-MM-dd'));
   const [batchEndDate, setBatchEndDate] = useState(format(addDays(new Date(), 2), 'yyyy-MM-dd'));
+  // 多设备模式下每台设备的自定义日期
+  const [equipmentDates, setEquipmentDates] = useState<EquipmentDateMap>({});
   const [batchError, setBatchError] = useState('');
+
+  // 重试弹窗相关状态
+  const [retryingItem, setRetryingItem] = useState<BatchResult['failed'][0] | null>(null);
+  const [retryDate, setRetryDate] = useState('');
+  const [retryStartTime, setRetryStartTime] = useState('');
+  const [retryEndTime, setRetryEndTime] = useState('');
+  const [retryError, setRetryError] = useState('');
 
   const currentUser = getCurrentUser();
 
@@ -87,6 +109,42 @@ export default function CalendarPage() {
     () => equipments.filter((e) => batchEquipmentIds.includes(e.id)),
     [equipments, batchEquipmentIds]
   );
+
+  // 初始化日期映射：选择设备时自动分配默认日期
+  useEffect(() => {
+    setEquipmentDates((prev) => {
+      const next = { ...prev };
+      batchEquipmentIds.forEach((id) => {
+        if (!next[id]) {
+          next[id] = batchStartDate;
+        }
+      });
+      // 清理已取消选中的设备
+      Object.keys(next).forEach((id) => {
+        if (!batchEquipmentIds.includes(id)) {
+          delete next[id];
+        }
+      });
+      return next;
+    });
+  }, [batchEquipmentIds, batchStartDate]);
+
+  const updateEquipmentDate = (equipmentId: string, date: string) => {
+    setEquipmentDates((prev) => ({
+      ...prev,
+      [equipmentId]: date,
+    }));
+  };
+
+  const applyDateToAllEquipments = (date: string) => {
+    setEquipmentDates((prev) => {
+      const next = { ...prev };
+      batchEquipmentIds.forEach((id) => {
+        next[id] = date;
+      });
+      return next;
+    });
+  };
 
   const handleSelectSlot = (start: Date, end: Date) => {
     setSelectedSlot({ start, end });
@@ -116,7 +174,16 @@ export default function CalendarPage() {
         setBatchError('请至少选择一台设备');
         return false;
       }
+      const missingDate = batchEquipmentIds.some((id) => !equipmentDates[id]);
+      if (missingDate) {
+        setBatchError('请为每台设备设置预约日期');
+        return false;
+      }
     } else {
+      if (!selectedEquipmentId) {
+        setBatchError('请选择要预约的设备');
+        return false;
+      }
       if (!batchStartDate || !batchEndDate) {
         setBatchError('请选择日期范围');
         return false;
@@ -177,101 +244,120 @@ export default function CalendarPage() {
 
   const executeBatchReservation = (): BatchResult => {
     const result: BatchResult = { success: [], failed: [] };
+    let tempIdCounter = 0;
 
     const [startH, startM] = batchStartTime.split(':').map(Number);
     const [endH, endM] = batchEndTime.split(':').map(Number);
 
-    let datesToProcess: Date[] = [];
-    let equipmentsToProcess: Equipment[] = [];
+    let items: Array<{ equipment: Equipment; date: Date }> = [];
 
     if (batchMode === 'multi-equipment') {
-      // 多设备模式：固定一天（今天），多台设备
-      datesToProcess = [parseISO(batchStartDate)];
-      equipmentsToProcess = batchEquipments;
+      // 多设备模式：每台设备使用自己的自定义日期
+      for (const equipment of batchEquipments) {
+        const dateStr = equipmentDates[equipment.id];
+        if (dateStr) {
+          items.push({ equipment, date: parseISO(dateStr) });
+        }
+      }
     } else {
       // 多日期模式：固定当前选中设备，连续多天
-      datesToProcess = eachDayOfInterval({
-        start: parseISO(batchStartDate),
-        end: parseISO(batchEndDate),
-      });
       const defaultEquipment = selectedEquipment || availableEquipments[0];
-      equipmentsToProcess = defaultEquipment ? [defaultEquipment] : [];
+      if (defaultEquipment) {
+        const days = eachDayOfInterval({
+          start: parseISO(batchStartDate),
+          end: parseISO(batchEndDate),
+        });
+        items = days.map((date) => ({ equipment: defaultEquipment, date }));
+      }
     }
 
-    for (const equipment of equipmentsToProcess) {
-      for (const date of datesToProcess) {
-        const start = new Date(date);
-        start.setHours(startH, startM, 0, 0);
-        const end = new Date(date);
-        end.setHours(endH, endM, 0, 0);
+    for (const { equipment, date } of items) {
+      const start = new Date(date);
+      start.setHours(startH, startM, 0, 0);
+      const end = new Date(date);
+      end.setHours(endH, endM, 0, 0);
 
-        const dateStr = format(date, 'MM月dd日');
-        const timeStr = `${batchStartTime} - ${batchEndTime}`;
+      const dateStr = format(date, 'MM月dd日');
+      const timeStr = `${batchStartTime} - ${batchEndTime}`;
 
-        // 1. 检查开放时间
-        const inOperatingHours = isWithinOperatingHours(
-          equipment.id,
-          start.toISOString(),
-          end.toISOString()
-        );
-        if (!inOperatingHours) {
-          result.failed.push({
-            equipmentId: equipment.id,
-            equipmentName: equipment.name,
-            date: dateStr,
-            time: timeStr,
-            reason: '时段不在设备开放时间内',
-          });
-          continue;
-        }
-
-        // 2. 检查时间冲突
-        const available = isSlotAvailable(
-          equipment.id,
-          start.toISOString(),
-          end.toISOString()
-        );
-        if (!available) {
-          result.failed.push({
-            equipmentId: equipment.id,
-            equipmentName: equipment.name,
-            date: dateStr,
-            time: timeStr,
-            reason: '与其他预约时段冲突',
-          });
-          continue;
-        }
-
-        // 3. 检查是否已过期
-        if (start < new Date()) {
-          result.failed.push({
-            equipmentId: equipment.id,
-            equipmentName: equipment.name,
-            date: dateStr,
-            time: timeStr,
-            reason: '预约时间已过期',
-          });
-          continue;
-        }
-
-        // 4. 提交预约
-        const newId = addReservation({
-          userId: currentUserId,
-          equipmentId: equipment.id,
-          startTime: start.toISOString(),
-          endTime: end.toISOString(),
-          purpose,
-          participants,
-        });
-
-        result.success.push({
-          id: newId,
+      // 1. 检查开放时间
+      const inOperatingHours = isWithinOperatingHours(
+        equipment.id,
+        start.toISOString(),
+        end.toISOString()
+      );
+      if (!inOperatingHours) {
+        tempIdCounter++;
+        result.failed.push({
+          tempId: `failed-${tempIdCounter}`,
           equipmentId: equipment.id,
           equipmentName: equipment.name,
           date: dateStr,
           time: timeStr,
+          isoDate: format(date, 'yyyy-MM-dd'),
+          startTime: batchStartTime,
+          endTime: batchEndTime,
+          reason: '时段不在设备开放时间内（含节假日或临时闭馆）',
         });
+        continue;
       }
+
+      // 2. 检查时间冲突
+      const available = isSlotAvailable(
+        equipment.id,
+        start.toISOString(),
+        end.toISOString()
+      );
+      if (!available) {
+        tempIdCounter++;
+        result.failed.push({
+          tempId: `failed-${tempIdCounter}`,
+          equipmentId: equipment.id,
+          equipmentName: equipment.name,
+          date: dateStr,
+          time: timeStr,
+          isoDate: format(date, 'yyyy-MM-dd'),
+          startTime: batchStartTime,
+          endTime: batchEndTime,
+          reason: '与其他预约时段冲突',
+        });
+        continue;
+      }
+
+      // 3. 检查是否已过期
+      if (start < new Date()) {
+        tempIdCounter++;
+        result.failed.push({
+          tempId: `failed-${tempIdCounter}`,
+          equipmentId: equipment.id,
+          equipmentName: equipment.name,
+          date: dateStr,
+          time: timeStr,
+          isoDate: format(date, 'yyyy-MM-dd'),
+          startTime: batchStartTime,
+          endTime: batchEndTime,
+          reason: '预约时间已过期',
+        });
+        continue;
+      }
+
+      // 4. 提交预约
+      const newId = addReservation({
+        userId: currentUserId,
+        equipmentId: equipment.id,
+        startTime: start.toISOString(),
+        endTime: end.toISOString(),
+        purpose,
+        participants,
+      });
+
+      result.success.push({
+        id: newId,
+        equipmentId: equipment.id,
+        equipmentName: equipment.name,
+        date: dateStr,
+        time: timeStr,
+      });
     }
 
     return result;
@@ -290,6 +376,10 @@ export default function CalendarPage() {
       } else {
         const result = executeBatchReservation();
         setBatchResult(result);
+        addAuditLog({
+          actionType: 'reservation.batch.submit',
+          detail: `批量预约提交：成功 ${result.success.length} 条，失败 ${result.failed.length} 条`,
+        });
         setIsSubmitting(false);
         setShowConfirmModal(false);
         setShowBatchSummaryModal(true);
@@ -306,6 +396,7 @@ export default function CalendarPage() {
 
   const resetBatchForm = () => {
     setBatchEquipmentIds([]);
+    setEquipmentDates({});
     setBatchStartDate(format(new Date(), 'yyyy-MM-dd'));
     setBatchEndDate(format(addDays(new Date(), 2), 'yyyy-MM-dd'));
     setBatchStartTime('09:00');
@@ -332,16 +423,149 @@ export default function CalendarPage() {
     const [startH, startM] = batchStartTime.split(':').map(Number);
     const [endH, endM] = batchEndTime.split(':').map(Number);
     const hours = (endH * 60 + endM - startH * 60 - startM) / 60;
-    const daysCount = batchMode === 'multi-equipment'
-      ? 1
-      : eachDayOfInterval({ start: parseISO(batchStartDate), end: parseISO(batchEndDate) }).length;
-    const eqCount = batchMode === 'multi-equipment'
-      ? batchEquipmentIds.length
-      : (selectedEquipment ? 1 : 0);
-    const totalCount = daysCount * eqCount;
+    let daysCount = 0;
+    let eqCount = 0;
 
-    return { hours, daysCount, eqCount, totalCount };
+    if (batchMode === 'multi-equipment') {
+      daysCount = 1;
+      eqCount = batchEquipmentIds.length;
+    } else {
+      if (batchStartDate && batchEndDate) {
+        daysCount = eachDayOfInterval({
+          start: parseISO(batchStartDate),
+          end: parseISO(batchEndDate),
+        }).length;
+      }
+      eqCount = selectedEquipment ? 1 : 0;
+    }
+
+    return { hours, daysCount, eqCount, totalCount: daysCount * eqCount };
   }, [batchMode, batchStartTime, batchEndTime, batchStartDate, batchEndDate, batchEquipmentIds.length, selectedEquipment]);
+
+  // ========== 重试失败预约 ==========
+  const openRetryModal = (item: BatchResult['failed'][0]) => {
+    setRetryingItem(item);
+    setRetryDate(item.isoDate);
+    setRetryStartTime(item.startTime);
+    setRetryEndTime(item.endTime);
+    setRetryError('');
+    setShowRetryModal(true);
+  };
+
+  const validateRetry = (): boolean => {
+    setRetryError('');
+    if (!retryDate || !retryStartTime || !retryEndTime) {
+      setRetryError('请选择完整的日期和时间');
+      return false;
+    }
+    const start = parseISO(`${retryDate}T${retryStartTime}`);
+    const end = parseISO(`${retryDate}T${retryEndTime}`);
+    if (end <= start) {
+      setRetryError('结束时间必须晚于开始时间');
+      return false;
+    }
+    if (start < new Date()) {
+      setRetryError('预约时间不能早于当前时间');
+      return false;
+    }
+    if (retryingItem) {
+      const inHours = isWithinOperatingHours(
+        retryingItem.equipmentId,
+        start.toISOString(),
+        end.toISOString()
+      );
+      if (!inHours) {
+        setRetryError('新时段仍不在设备开放时间内');
+        return false;
+      }
+      const available = isSlotAvailable(
+        retryingItem.equipmentId,
+        start.toISOString(),
+        end.toISOString()
+      );
+      if (!available) {
+        setRetryError('新时段仍有冲突');
+        return false;
+      }
+    }
+    return true;
+  };
+
+  const handleRetrySubmit = () => {
+    if (!validateRetry() || !retryingItem) return;
+
+    const start = parseISO(`${retryDate}T${retryStartTime}`);
+    const end = parseISO(`${retryDate}T${retryEndTime}`);
+    const newId = addReservation({
+      userId: currentUserId,
+      equipmentId: retryingItem.equipmentId,
+      startTime: start.toISOString(),
+      endTime: end.toISOString(),
+      purpose,
+      participants,
+    });
+
+    // 从失败列表移到成功列表
+    setBatchResult((prev) => {
+      const item = prev.failed.find((f) => f.tempId === retryingItem.tempId);
+      if (!item) return prev;
+      return {
+        success: [
+          ...prev.success,
+          {
+            id: newId,
+            equipmentId: item.equipmentId,
+            equipmentName: item.equipmentName,
+            date: format(start, 'MM月dd日'),
+            time: `${retryStartTime} - ${retryEndTime}`,
+          },
+        ],
+        failed: prev.failed.filter((f) => f.tempId !== retryingItem.tempId),
+      };
+    });
+
+    setShowRetryModal(false);
+    setRetryingItem(null);
+  };
+
+  const retryAllFailed = () => {
+    // 简单版：逐个按原参数重试，成功的移到成功列表
+    setBatchResult((prev) => {
+      const newSuccess = [...prev.success];
+      const newFailed: BatchResult['failed'] = [];
+
+      for (const item of prev.failed) {
+        const start = parseISO(`${item.isoDate}T${item.startTime}`);
+        const end = parseISO(`${item.isoDate}T${item.endTime}`);
+
+        if (
+          start >= new Date() &&
+          isWithinOperatingHours(item.equipmentId, start.toISOString(), end.toISOString()) &&
+          isSlotAvailable(item.equipmentId, start.toISOString(), end.toISOString())
+        ) {
+          const newId = addReservation({
+            userId: currentUserId,
+            equipmentId: item.equipmentId,
+            startTime: start.toISOString(),
+            endTime: end.toISOString(),
+            purpose,
+            participants,
+          });
+          newSuccess.push({
+            id: newId,
+            equipmentId: item.equipmentId,
+            equipmentName: item.equipmentName,
+            date: item.date,
+            time: item.time,
+          });
+        } else {
+          newFailed.push(item);
+        }
+      }
+
+      return { success: newSuccess, failed: newFailed };
+    });
+  };
 
   return (
     <div className="space-y-6">
@@ -369,7 +593,6 @@ export default function CalendarPage() {
           >
             <Layers className="w-4 h-4" />
             批量预约
-            <span className="text-[10px] bg-primary-50 text-primary-600 px-1.5 py-0.5 rounded">NEW</span>
           </button>
         </div>
       </div>
@@ -543,10 +766,7 @@ export default function CalendarPage() {
                 <CalendarDays className="w-8 h-8 text-neutral-400" />
               </div>
               <p className="text-neutral-500 mb-4">请先选择要预约的设备</p>
-              <button
-                onClick={() => navigate('/')}
-                className="btn-primary"
-              >
+              <button onClick={() => navigate('/')} className="btn-primary">
                 浏览设备列表
               </button>
             </div>
@@ -568,7 +788,7 @@ export default function CalendarPage() {
                   }`}
                 >
                   <Layers className="w-3.5 h-3.5 inline mr-1" />
-                  同时预约多台设备
+                  多设备自选日期
                 </button>
                 <button
                   onClick={() => setBatchMode('multi-days')}
@@ -579,13 +799,13 @@ export default function CalendarPage() {
                   }`}
                 >
                   <CalendarRange className="w-3.5 h-3.5 inline mr-1" />
-                  连续多天预约
+                  单设备连续多天
                 </button>
               </div>
             </div>
 
             {batchMode === 'multi-equipment' ? (
-              /* 多选设备 */
+              /* 多选设备 + 自定义日期 */
               <div>
                 <div className="flex items-center justify-between mb-3">
                   <label className="text-sm font-medium text-neutral-700">
@@ -598,14 +818,15 @@ export default function CalendarPage() {
                     {batchEquipmentIds.length === availableEquipments.length ? '取消全选' : '全选'}
                   </button>
                 </div>
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 max-h-[300px] overflow-y-auto p-1">
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-[380px] overflow-y-auto p-1">
                   {availableEquipments.map((eq) => {
                     const checked = batchEquipmentIds.includes(eq.id);
                     return (
                       <div
                         key={eq.id}
                         onClick={() => toggleBatchEquipment(eq.id)}
-                        className={`p-3 rounded-lg border-2 cursor-pointer transition-all ${
+                        className={`p-4 rounded-lg border-2 cursor-pointer transition-all ${
                           checked
                             ? 'border-primary-500 bg-primary-50'
                             : 'border-neutral-200 hover:border-neutral-300 bg-white'
@@ -613,27 +834,65 @@ export default function CalendarPage() {
                       >
                         <div className="flex items-start gap-3">
                           <div className={`w-5 h-5 rounded-md border-2 flex items-center justify-center flex-shrink-0 mt-0.5 ${
-                            checked
-                              ? 'bg-primary-500 border-primary-500'
-                              : 'border-neutral-300'
+                            checked ? 'bg-primary-500 border-primary-500' : 'border-neutral-300'
                           }`}>
                             {checked && <CheckCircle2 className="w-3.5 h-3.5 text-white" />}
                           </div>
                           <div className="flex-1 min-w-0">
-                            <div className="flex items-center gap-2">
+                            <div className="flex items-center gap-2 mb-1">
                               <p className="font-medium text-neutral-800 text-sm truncate">{eq.name}</p>
                               <StatusBadge status={eq.status} type="equipment" />
                             </div>
-                            <p className="text-xs text-neutral-500 mt-0.5">{eq.location}</p>
+                            <p className="text-xs text-neutral-500 mb-2">{eq.location}</p>
+                            {checked && (
+                              <div
+                                onClick={(e) => e.stopPropagation()}
+                                className="mt-2 space-y-1"
+                              >
+                                <div className="flex items-center gap-2">
+                                  <label className="text-xs text-neutral-500 whitespace-nowrap">预约日期：</label>
+                                  <input
+                                    type="date"
+                                    value={equipmentDates[eq.id] || batchStartDate}
+                                    onChange={(e) => updateEquipmentDate(eq.id, e.target.value)}
+                                    min={format(new Date(), 'yyyy-MM-dd')}
+                                    className="input text-xs py-1.5 px-2 flex-1"
+                                  />
+                                </div>
+                              </div>
+                            )}
                           </div>
                         </div>
                       </div>
                     );
                   })}
                 </div>
+
+                {batchEquipmentIds.length > 0 && (
+                  <div className="mt-4 p-3 bg-neutral-50 rounded-lg flex items-center justify-between flex-wrap gap-2">
+                    <p className="text-xs text-neutral-500">
+                      快捷操作：将所有已选设备的日期统一设为：
+                    </p>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="date"
+                        value={batchStartDate}
+                        onChange={(e) => setBatchStartDate(e.target.value)}
+                        min={format(new Date(), 'yyyy-MM-dd')}
+                        className="input text-xs py-1.5 px-2"
+                      />
+                      <button
+                        onClick={() => applyDateToAllEquipments(batchStartDate)}
+                        className="btn-secondary btn-sm"
+                      >
+                        批量应用
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
             ) : (
-              /* 多日期 */
+              /* 多日期模式 */
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
                 <div>
                   <label className="block text-sm font-medium text-neutral-700 mb-1.5">
@@ -761,7 +1020,7 @@ export default function CalendarPage() {
                       <li>• 系统将自动为每个（设备 × 日期）组合生成独立预约</li>
                       <li>• 每条预约会分别校验开放时间和时段冲突</li>
                       <li>• 提交后会显示成功和失败的汇总清单</li>
-                      <li>• 失败的预约不会占用设备时段，可稍后重试</li>
+                      <li>• 失败的预约可直接调整参数后重试</li>
                     </ul>
                   </div>
                 </div>
@@ -830,10 +1089,7 @@ export default function CalendarPage() {
                     </div>
                   )}
 
-                  <button
-                    onClick={handleBatchSubmit}
-                    className="w-full btn-primary btn-lg"
-                  >
+                  <button onClick={handleBatchSubmit} className="w-full btn-primary btn-lg">
                     <Layers className="w-4 h-4" />
                     提交批量预约申请
                   </button>
@@ -855,9 +1111,7 @@ export default function CalendarPage() {
             <div className="p-4 bg-neutral-50 rounded-lg space-y-3">
               <div className="flex justify-between">
                 <span className="text-sm text-neutral-500">设备</span>
-                <span className="text-sm font-medium text-neutral-800">
-                  {selectedEquipment?.name}
-                </span>
+                <span className="text-sm font-medium text-neutral-800">{selectedEquipment?.name}</span>
               </div>
               <div className="flex justify-between">
                 <span className="text-sm text-neutral-500">时段</span>
@@ -869,9 +1123,7 @@ export default function CalendarPage() {
               </div>
               <div className="flex justify-between">
                 <span className="text-sm text-neutral-500">申请人</span>
-                <span className="text-sm font-medium text-neutral-800">
-                  {currentUser?.name}
-                </span>
+                <span className="text-sm font-medium text-neutral-800">{currentUser?.name}</span>
               </div>
               <div className="border-t border-neutral-200 pt-3">
                 <span className="text-sm text-neutral-500 block mb-1">实验目的</span>
@@ -883,7 +1135,7 @@ export default function CalendarPage() {
               <div className="flex justify-between">
                 <span className="text-sm text-neutral-500">预约模式</span>
                 <span className="text-sm font-medium text-neutral-800">
-                  {batchMode === 'multi-equipment' ? '多设备预约' : '多日期预约'}
+                  {batchMode === 'multi-equipment' ? '多设备自选日期' : '多日期预约'}
                 </span>
               </div>
               <div className="flex justify-between">
@@ -993,20 +1245,35 @@ export default function CalendarPage() {
           {/* 失败列表 */}
           {batchResult.failed.length > 0 && (
             <div>
-              <h4 className="text-sm font-semibold text-neutral-700 mb-2 flex items-center gap-2">
-                <XCircle className="w-4 h-4 text-danger-500" />
-                预约失败（{batchResult.failed.length} 条）
-              </h4>
-              <div className="max-h-[180px] overflow-y-auto border border-neutral-200 rounded-lg divide-y divide-neutral-100">
-                {batchResult.failed.map((item, idx) => (
-                  <div key={idx} className="p-3 flex items-center justify-between bg-danger-50/30">
-                    <div className="flex items-center gap-3">
-                      <XCircle className="w-4 h-4 text-danger-500 flex-shrink-0" />
-                      <div>
-                        <p className="text-sm font-medium text-neutral-800">{item.equipmentName}</p>
-                        <p className="text-xs text-neutral-500">{item.date} · {item.time}</p>
-                        <p className="text-xs text-danger-600 mt-0.5">原因：{item.reason}</p>
+              <div className="flex items-center justify-between mb-2">
+                <h4 className="text-sm font-semibold text-neutral-700 flex items-center gap-2">
+                  <XCircle className="w-4 h-4 text-danger-500" />
+                  预约失败（{batchResult.failed.length} 条）
+                </h4>
+                <button onClick={retryAllFailed} className="btn-secondary btn-sm">
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  全部按原参数重试
+                </button>
+              </div>
+              <div className="max-h-[260px] overflow-y-auto border border-neutral-200 rounded-lg divide-y divide-neutral-100">
+                {batchResult.failed.map((item) => (
+                  <div key={item.tempId} className="p-3 bg-danger-50/30">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex items-start gap-3">
+                        <XCircle className="w-4 h-4 text-danger-500 flex-shrink-0 mt-0.5" />
+                        <div>
+                          <p className="text-sm font-medium text-neutral-800">{item.equipmentName}</p>
+                          <p className="text-xs text-neutral-500">{item.date} · {item.time}</p>
+                          <p className="text-xs text-danger-600 mt-0.5">原因：{item.reason}</p>
+                        </div>
                       </div>
+                      <button
+                        onClick={() => openRetryModal(item)}
+                        className="btn-secondary btn-sm flex-shrink-0"
+                      >
+                        <Edit3 className="w-3.5 h-3.5" />
+                        调整重试
+                      </button>
                     </div>
                   </div>
                 ))}
@@ -1016,10 +1283,114 @@ export default function CalendarPage() {
 
           <div className="flex justify-end gap-3 pt-2 border-t border-neutral-100">
             <button onClick={handleBatchSummaryClose} className="btn-primary">
-              查看我的预约
+              <Save className="w-3.5 h-3.5" />
+              完成并查看预约
             </button>
           </div>
         </div>
+      </Modal>
+
+      {/* 重试单条失败预约弹窗 */}
+      <Modal
+        isOpen={showRetryModal}
+        onClose={() => {
+          setShowRetryModal(false);
+          setRetryingItem(null);
+        }}
+        title="调整预约参数并重试"
+      >
+        {retryingItem && (
+          <div className="space-y-4">
+            <div className="p-3 bg-neutral-50 rounded-lg">
+              <p className="text-sm font-medium text-neutral-800 mb-0.5">{retryingItem.equipmentName}</p>
+              <p className="text-xs text-neutral-500">
+                原参数：{retryingItem.date} · {retryingItem.time}
+              </p>
+              <p className="text-xs text-danger-600 mt-1">失败原因：{retryingItem.reason}</p>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+              <div>
+                <label className="block text-sm font-medium text-neutral-700 mb-1.5">
+                  预约日期
+                </label>
+                <input
+                  type="date"
+                  value={retryDate}
+                  onChange={(e) => {
+                    setRetryDate(e.target.value);
+                    setRetryError('');
+                  }}
+                  min={format(new Date(), 'yyyy-MM-dd')}
+                  className="input"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-neutral-700 mb-1.5">
+                  开始时间
+                </label>
+                <select
+                  value={retryStartTime}
+                  onChange={(e) => {
+                    setRetryStartTime(e.target.value);
+                    setRetryError('');
+                  }}
+                  className="select"
+                >
+                  {Array.from({ length: 13 }, (_, i) => i + 8).map((hour) => (
+                    <option key={hour} value={`${hour.toString().padStart(2, '0')}:00`}>
+                      {hour.toString().padStart(2, '0')}:00
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-neutral-700 mb-1.5">
+                  结束时间
+                </label>
+                <select
+                  value={retryEndTime}
+                  onChange={(e) => {
+                    setRetryEndTime(e.target.value);
+                    setRetryError('');
+                  }}
+                  className="select"
+                >
+                  {Array.from({ length: 13 }, (_, i) => i + 9).map((hour) => (
+                    <option key={hour} value={`${hour.toString().padStart(2, '0')}:00`}>
+                      {hour.toString().padStart(2, '0')}:00
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            {retryError && (
+              <div className="p-3 bg-danger-50 border border-danger-100 rounded-lg">
+                <div className="flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 text-danger-500 mt-0.5 flex-shrink-0" />
+                  <p className="text-sm text-danger-700">{retryError}</p>
+                </div>
+              </div>
+            )}
+
+            <div className="flex justify-end gap-3 pt-2">
+              <button
+                onClick={() => {
+                  setShowRetryModal(false);
+                  setRetryingItem(null);
+                }}
+                className="btn-secondary"
+              >
+                取消
+              </button>
+              <button onClick={handleRetrySubmit} className="btn-primary">
+                <RefreshCw className="w-3.5 h-3.5" />
+                确认重试
+              </button>
+            </div>
+          </div>
+        )}
       </Modal>
     </div>
   );

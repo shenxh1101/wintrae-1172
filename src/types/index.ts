@@ -126,6 +126,32 @@ export interface Holiday {
   description?: string;
 }
 
+export type AuditLogActionType =
+  | 'equipment.status.change'
+  | 'equipment.schedule.update'
+  | 'equipment.schedule.exception.add'
+  | 'equipment.schedule.exception.update'
+  | 'equipment.schedule.exception.remove'
+  | 'holiday.add'
+  | 'holiday.remove'
+  | 'reservation.batch.submit'
+  | 'reservation.approve'
+  | 'reservation.reject'
+  | 'reservation.cancel'
+  | 'reservation.modify'
+  | 'user.blacklist.toggle';
+
+export interface AuditLog {
+  id: string;
+  actionType: AuditLogActionType;
+  operatorId?: string;
+  operatorName?: string;
+  targetId?: string;
+  targetName?: string;
+  detail: string;
+  createdAt: string;
+}
+
 export interface PersistState {
   reservations: Reservation[];
   consumables: Consumable[];
@@ -135,4 +161,5 @@ export interface PersistState {
   equipments: Equipment[];
   schedules: EquipmentSchedule[];
   holidays: Holiday[];
+  auditLogs: AuditLog[];
 }

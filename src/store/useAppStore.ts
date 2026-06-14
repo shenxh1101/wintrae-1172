@@ -23,6 +23,8 @@ import type {
   EquipmentSchedule,
   Holiday,
   PersistState,
+  AuditLog,
+  AuditLogActionType,
 } from '@/types';
 import {
   equipments as mockEquipments,
@@ -40,6 +42,8 @@ import {
 } from '@/data/scheduleData';
 import { loadState, saveState } from '@/utils/persist';
 
+const weekDayNames = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+
 interface AppState {
   currentUserId: string;
   departments: Department[];
@@ -52,6 +56,7 @@ interface AppState {
   notifications: Notification[];
   schedules: EquipmentSchedule[];
   holidays: Holiday[];
+  auditLogs: AuditLog[];
   selectedEquipmentId: string | null;
   selectedDate: Date;
   filterDate: string;
@@ -71,6 +76,16 @@ interface AppState {
   isSlotAvailable: (equipmentId: string, startTime: string, endTime: string, excludeId?: string) => boolean;
   isWithinOperatingHours: (equipmentId: string, startTime: string, endTime: string) => boolean;
   getAvailableEquipmentsByTime: (date: string, startTime: string, endTime: string, departmentId?: string, typeId?: string) => Equipment[];
+  getEquipmentAvailabilityDetail: (equipmentId: string, date: string, startTime: string, endTime: string) => {
+    available: boolean;
+    reason?: string;
+    ruleType?: 'status' | 'holiday' | 'exception' | 'schedule' | 'conflict' | 'expired';
+    alternativeWindow?: string;
+  };
+  validateTimeFilterParams: (date: string, startTime: string, endTime: string) => {
+    valid: boolean;
+    error?: string;
+  };
   canModifyReservation: (reservation: Reservation) => boolean;
 
   setSelectedEquipment: (id: string | null) => void;
@@ -103,6 +118,7 @@ interface AppState {
   removeScheduleException: (equipmentId: string, exceptionId: string) => void;
   addHoliday: (holiday: Omit<Holiday, 'id'>) => void;
   removeHoliday: (id: string) => void;
+  addAuditLog: (data: Omit<AuditLog, 'id' | 'createdAt'>) => void;
 
   resetToDefault: () => void;
   persist: () => void;
@@ -124,6 +140,7 @@ const getInitialState = () => {
       equipments: persisted.equipments || mockEquipments,
       schedules: persisted.schedules || defaultSchedules,
       holidays: persisted.holidays || defaultHolidays,
+      auditLogs: persisted.auditLogs || [],
     };
   }
 
@@ -136,6 +153,7 @@ const getInitialState = () => {
     equipments: mockEquipments,
     schedules: defaultSchedules,
     holidays: defaultHolidays,
+    auditLogs: [],
   };
 };
 
@@ -153,6 +171,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   notifications: initialState.notifications,
   schedules: initialState.schedules,
   holidays: initialState.holidays,
+  auditLogs: initialState.auditLogs,
   selectedEquipmentId: null,
   selectedDate: new Date(),
   filterDate: '',
@@ -307,6 +326,129 @@ export const useAppStore = create<AppState>((set, get) => ({
     });
   },
 
+  validateTimeFilterParams: (date, startTime, endTime) => {
+    if (!date || !startTime || !endTime) {
+      return { valid: true };
+    }
+    const [startH, startM] = startTime.split(':').map(Number);
+    const [endH, endM] = endTime.split(':').map(Number);
+    if (endH * 60 + endM <= startH * 60 + startM) {
+      return { valid: false, error: '结束时间必须晚于开始时间' };
+    }
+    const baseDate = parseISO(date);
+    const fullStart = setMinutes(setHours(baseDate, startH), startM);
+    if (fullStart < new Date()) {
+      return { valid: false, error: '预约时间不能早于当前时间' };
+    }
+    return { valid: true };
+  },
+
+  getEquipmentAvailabilityDetail: (equipmentId, date, startTime, endTime) => {
+    if (!date || !startTime || !endTime) {
+      return { available: true };
+    }
+    const { equipments, holidays, reservations } = get();
+    const equipment = equipments.find((e) => e.id === equipmentId);
+    if (!equipment) {
+      return { available: false, ruleType: 'status', reason: '设备不存在' };
+    }
+    if (equipment.status === 'disabled') {
+      return { available: false, ruleType: 'status', reason: '设备已停用' };
+    }
+    if (equipment.status === 'maintenance') {
+      return { available: false, ruleType: 'status', reason: '设备维护中' };
+    }
+
+    const [startHour, startMin] = startTime.split(':').map(Number);
+    const [endHour, endMin] = endTime.split(':').map(Number);
+    const baseDate = parseISO(date);
+    const fullStart = setMinutes(setHours(baseDate, startHour), startMin);
+    const fullEnd = setMinutes(setHours(baseDate, endHour), endMin);
+
+    if (fullStart < new Date()) {
+      return { available: false, ruleType: 'expired', reason: '预约时间已过期' };
+    }
+
+    const schedule = get().getScheduleByEquipment(equipmentId);
+    if (schedule) {
+      const dateStr = format(baseDate, 'yyyy-MM-dd');
+      const exception = schedule.exceptions.find((e) => e.date === dateStr);
+      if (exception) {
+        if (!exception.enabled) {
+          return {
+            available: false,
+            ruleType: 'exception',
+            reason: `临时闭馆：${exception.reason || '设备特殊安排'}`,
+          };
+        }
+        if (exception.startTime && exception.endTime) {
+          const [exSH, exSM] = exception.startTime.split(':').map(Number);
+          const [exEH, exEM] = exception.endTime.split(':').map(Number);
+          const exStart = setMinutes(setHours(baseDate, exSH), exSM);
+          const exEnd = setMinutes(setHours(baseDate, exEH), exEM);
+          if (!(fullStart >= exStart && fullEnd <= exEnd)) {
+            return {
+              available: false,
+              ruleType: 'exception',
+              reason: `特殊开放时段仅 ${exception.startTime} - ${exception.endTime}`,
+              alternativeWindow: `${exception.startTime} - ${exception.endTime}`,
+            };
+          }
+        }
+      } else {
+        const holiday = holidays.find((h) =>
+          isWithinInterval(baseDate, {
+            start: startOfDay(parseISO(h.startDate)),
+            end: endOfDay(parseISO(h.endDate)),
+          })
+        );
+        if (holiday) {
+          return {
+            available: false,
+            ruleType: 'holiday',
+            reason: `节假日关闭：${holiday.name}${holiday.description ? ' - ' + holiday.description : ''}`,
+          };
+        }
+
+        const dayOfWeek = baseDate.getDay();
+        const daySchedule = schedule.defaultSchedule.find((d) => d.dayOfWeek === dayOfWeek);
+        if (!daySchedule || !daySchedule.enabled) {
+          return {
+            available: false,
+            ruleType: 'schedule',
+            reason: `设备每周${weekDayNames[dayOfWeek]}例行不开放`,
+          };
+        }
+        const [dSH, dSM] = daySchedule.startTime.split(':').map(Number);
+        const [dEH, dEM] = daySchedule.endTime.split(':').map(Number);
+        const dStart = setMinutes(setHours(baseDate, dSH), dSM);
+        const dEnd = setMinutes(setHours(baseDate, dEH), dEM);
+        if (!(fullStart >= dStart && fullEnd <= dEnd)) {
+          return {
+            available: false,
+            ruleType: 'schedule',
+            reason: `不在开放时段内，该日开放时间 ${daySchedule.startTime} - ${daySchedule.endTime}`,
+            alternativeWindow: `${daySchedule.startTime} - ${daySchedule.endTime}`,
+          };
+        }
+      }
+    }
+
+    const hasConflict = reservations.some((r) => {
+      if (r.equipmentId !== equipmentId) return false;
+      if (r.status === 'cancelled' || r.status === 'rejected') return false;
+      return areIntervalsOverlapping(
+        { start: fullStart, end: fullEnd },
+        { start: new Date(r.startTime), end: new Date(r.endTime) }
+      );
+    });
+    if (hasConflict) {
+      return { available: false, ruleType: 'conflict', reason: '与其他预约时段冲突' };
+    }
+
+    return { available: true };
+  },
+
   canModifyReservation: (reservation: Reservation) => {
     return reservation.status === 'pending' || reservation.status === 'approved';
   },
@@ -368,6 +510,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       return false;
     }
 
+    const eq = get().getEquipmentById(reservation.equipmentId);
+
     set((state) => ({
       reservations: state.reservations.map((r) =>
         r.id === id
@@ -384,17 +528,29 @@ export const useAppStore = create<AppState>((set, get) => ({
           : r
       ),
     }));
-    get().persist();
+    get().addAuditLog({
+      actionType: 'reservation.modify',
+      targetId: id,
+      targetName: eq?.name || reservation.equipmentId,
+      detail: `修改预约时段：${format(new Date(startTime), 'MM月dd日 HH:mm')} - ${format(new Date(endTime), 'HH:mm')}`,
+    });
     return true;
   },
 
   cancelReservation: (id: string) => {
+    const r = get().reservations.find((x) => x.id === id);
+    const eq = r ? get().getEquipmentById(r.equipmentId) : undefined;
     set((state) => ({
       reservations: state.reservations.map((r) =>
         r.id === id ? { ...r, status: 'cancelled' as ReservationStatus } : r
       ),
     }));
-    get().persist();
+    get().addAuditLog({
+      actionType: 'reservation.cancel',
+      targetId: id,
+      targetName: eq?.name || r?.equipmentId || id,
+      detail: `取消预约${r ? `（${format(new Date(r.startTime), 'MM月dd日 HH:mm')} - ${format(new Date(r.endTime), 'HH:mm')}）` : ''}`,
+    });
   },
 
   checkIn: (id: string) => {
@@ -429,6 +585,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   approveReservation: (id: string, comment?: string) => {
+    const r = get().reservations.find((x) => x.id === id);
+    const eq = r ? get().getEquipmentById(r.equipmentId) : undefined;
     set((state) => ({
       reservations: state.reservations.map((r) =>
         r.id === id
@@ -436,10 +594,17 @@ export const useAppStore = create<AppState>((set, get) => ({
           : r
       ),
     }));
-    get().persist();
+    get().addAuditLog({
+      actionType: 'reservation.approve',
+      targetId: id,
+      targetName: eq?.name || r?.equipmentId || id,
+      detail: `审批通过预约${r ? `（${format(new Date(r.startTime), 'MM月dd日 HH:mm')} - ${format(new Date(r.endTime), 'HH:mm')}）` : ''}${comment ? `：${comment}` : ''}`,
+    });
   },
 
   rejectReservation: (id: string, comment: string) => {
+    const r = get().reservations.find((x) => x.id === id);
+    const eq = r ? get().getEquipmentById(r.equipmentId) : undefined;
     set((state) => ({
       reservations: state.reservations.map((r) =>
         r.id === id
@@ -447,7 +612,12 @@ export const useAppStore = create<AppState>((set, get) => ({
           : r
       ),
     }));
-    get().persist();
+    get().addAuditLog({
+      actionType: 'reservation.reject',
+      targetId: id,
+      targetName: eq?.name || r?.equipmentId || id,
+      detail: `驳回预约${r ? `（${format(new Date(r.startTime), 'MM月dd日 HH:mm')} - ${format(new Date(r.endTime), 'HH:mm')}）` : ''}：${comment}`,
+    });
   },
 
   addConsumptionRecord: (data) => {
@@ -468,6 +638,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   toggleUserBlacklist: (userId: string, reason?: string) => {
+    const u = get().users.find((x) => x.id === userId);
     set((state) => ({
       users: state.users.map((u) =>
         u.id === userId
@@ -479,7 +650,13 @@ export const useAppStore = create<AppState>((set, get) => ({
           : u
       ),
     }));
-    get().persist();
+    const uAfter = get().users.find((x) => x.id === userId);
+    get().addAuditLog({
+      actionType: 'user.blacklist.toggle',
+      targetId: userId,
+      targetName: u?.name || userId,
+      detail: uAfter?.isBlacklisted ? `加入黑名单${reason ? `：${reason}` : ''}` : `移出黑名单`,
+    });
   },
 
   addNotification: (data) => {
@@ -494,24 +671,38 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   updateEquipmentStatus: (id: string, status: Equipment['status']) => {
+    const eq = get().getEquipmentById(id);
     set((state) => ({
       equipments: state.equipments.map((e) =>
         e.id === id ? { ...e, status } : e
       ),
     }));
-    get().persist();
+    const statusText = { available: '正常开放', 'in-use': '使用中', maintenance: '维护中', disabled: '已停用' }[status] || status;
+    get().addAuditLog({
+      actionType: 'equipment.status.change',
+      targetId: id,
+      targetName: eq?.name || id,
+      detail: `将设备状态改为【${statusText}】`,
+    });
   },
 
   updateEquipmentSchedule: (equipmentId: string, schedule: Partial<EquipmentSchedule>) => {
+    const eq = get().getEquipmentById(equipmentId);
     set((state) => ({
       schedules: state.schedules.map((s) =>
         s.equipmentId === equipmentId ? { ...s, ...schedule } : s
       ),
     }));
-    get().persist();
+    get().addAuditLog({
+      actionType: 'equipment.schedule.update',
+      targetId: equipmentId,
+      targetName: eq?.name || equipmentId,
+      detail: '更新设备默认开放时间表',
+    });
   },
 
   addScheduleException: (equipmentId: string, exception: Omit<import('@/types').ScheduleException, 'id'>) => {
+    const eq = get().getEquipmentById(equipmentId);
     set((state) => ({
       schedules: state.schedules.map((s) => {
         if (s.equipmentId !== equipmentId) return s;
@@ -532,10 +723,16 @@ export const useAppStore = create<AppState>((set, get) => ({
         };
       }),
     }));
-    get().persist();
+    get().addAuditLog({
+      actionType: 'equipment.schedule.exception.add',
+      targetId: equipmentId,
+      targetName: eq?.name || equipmentId,
+      detail: `${exception.enabled ? '添加/覆盖' : '添加/覆盖'}例外日期【${exception.date}】：${exception.reason || (exception.enabled ? '特殊开放' : '临时闭馆')}`,
+    });
   },
 
   updateScheduleException: (equipmentId: string, exceptionId: string, data: Partial<Omit<import('@/types').ScheduleException, 'id'>>) => {
+    const eq = get().getEquipmentById(equipmentId);
     set((state) => ({
       schedules: state.schedules.map((s) =>
         s.equipmentId === equipmentId
@@ -548,10 +745,16 @@ export const useAppStore = create<AppState>((set, get) => ({
           : s
       ),
     }));
-    get().persist();
+    get().addAuditLog({
+      actionType: 'equipment.schedule.exception.update',
+      targetId: equipmentId,
+      targetName: eq?.name || equipmentId,
+      detail: `编辑例外日期【${data.date || exceptionId}】`,
+    });
   },
 
   removeScheduleException: (equipmentId: string, exceptionId: string) => {
+    const eq = get().getEquipmentById(equipmentId);
     set((state) => ({
       schedules: state.schedules.map((s) =>
         s.equipmentId === equipmentId
@@ -559,21 +762,38 @@ export const useAppStore = create<AppState>((set, get) => ({
           : s
       ),
     }));
-    get().persist();
+    get().addAuditLog({
+      actionType: 'equipment.schedule.exception.remove',
+      targetId: equipmentId,
+      targetName: eq?.name || equipmentId,
+      detail: '删除例外日期规则',
+    });
   },
 
   addHoliday: (holiday) => {
+    const newHoliday: Holiday = { ...holiday, id: generateId('holiday') };
     set((state) => ({
-      holidays: [...state.holidays, { ...holiday, id: generateId('holiday') }],
+      holidays: [...state.holidays, newHoliday],
     }));
-    get().persist();
+    get().addAuditLog({
+      actionType: 'holiday.add',
+      targetId: newHoliday.id,
+      targetName: holiday.name,
+      detail: `添加节假日：${holiday.name}（${holiday.startDate} 至 ${holiday.endDate}）`,
+    });
   },
 
   removeHoliday: (id) => {
+    const h = get().holidays.find((x) => x.id === id);
     set((state) => ({
       holidays: state.holidays.filter((h) => h.id !== id),
     }));
-    get().persist();
+    get().addAuditLog({
+      actionType: 'holiday.remove',
+      targetId: id,
+      targetName: h?.name || id,
+      detail: `删除节假日：${h?.name || id}`,
+    });
   },
 
   resetToDefault: () => {
@@ -600,6 +820,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       equipments,
       schedules,
       holidays,
+      auditLogs,
     } = get();
 
     const stateToPersist: PersistState = {
@@ -611,8 +832,24 @@ export const useAppStore = create<AppState>((set, get) => ({
       equipments,
       schedules,
       holidays,
+      auditLogs,
     };
 
     saveState(stateToPersist);
+  },
+
+  addAuditLog: (data) => {
+    const operator = get().getCurrentUser();
+    const newLog: AuditLog = {
+      ...data,
+      id: generateId('log'),
+      createdAt: new Date().toISOString(),
+      operatorId: data.operatorId || operator?.id || 'system',
+      operatorName: data.operatorName || operator?.name || '系统',
+    };
+    set((state) => ({
+      auditLogs: [newLog, ...state.auditLogs].slice(0, 500),
+    }));
+    get().persist();
   },
 }));

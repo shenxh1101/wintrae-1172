@@ -3,10 +3,13 @@ import {
   ClipboardCheck,
   Clock,
   Users,
+  Users as UsersIcon,
   Bell,
   BarChart3,
+  BarChart,
   Check,
   X,
+  XCircle,
   Download,
   UserX,
   UserCheck,
@@ -18,21 +21,28 @@ import {
   CalendarOff,
   Calendar,
   RefreshCw,
+  List,
+  ClipboardList,
+  Activity,
+  History,
+  FileText,
+  AlertCircle,
 } from 'lucide-react';
-import { format, startOfMonth, endOfMonth, eachDayOfInterval, parseISO } from 'date-fns';
+import { format, startOfMonth, endOfMonth, eachDayOfInterval, parseISO, isToday, startOfDay, endOfDay, isWithinInterval } from 'date-fns';
 import { zhCN } from 'date-fns/locale';
 import { useAppStore } from '@/store/useAppStore';
 import StatusBadge from '@/components/StatusBadge';
 import Modal from '@/components/Modal';
 import Tabs from '@/components/Tabs';
-import type { DaySchedule, Holiday, ScheduleException } from '@/types';
+import type { AuditLogActionType, DaySchedule, Holiday, ScheduleException } from '@/types';
 
 const sideMenuItems = [
   { key: 'review', label: '预约审核', icon: ClipboardCheck },
-  { key: 'time', label: '时间设置', icon: Clock },
+  { key: 'time', label: '设备看板', icon: Activity },
   { key: 'users', label: '账号管理', icon: Users },
   { key: 'notifications', label: '通知发布', icon: Bell },
   { key: 'stats', label: '统计导出', icon: BarChart3 },
+  { key: 'logs', label: '操作日志', icon: History },
 ];
 
 export default function AdminPage() {
@@ -43,6 +53,7 @@ export default function AdminPage() {
     notifications,
     schedules,
     holidays,
+    auditLogs,
     getEquipmentById,
     getUserById,
     getScheduleByEquipment,
@@ -72,6 +83,7 @@ export default function AdminPage() {
   const [notifStartDate, setNotifStartDate] = useState('');
   const [notifEndDate, setNotifEndDate] = useState('');
   const [viewingReservation, setViewingReservation] = useState<string | null>(null);
+  const [logFilter, setLogFilter] = useState<AuditLogActionType | 'all'>('all');
 
   // 时间表编辑弹窗
   const [showScheduleModal, setShowScheduleModal] = useState(false);
@@ -262,6 +274,66 @@ export default function AdminPage() {
       daysInMonth: daysInMonth.length,
     };
   }, [reservations, equipments]);
+
+  const logActionLabel: Record<AuditLogActionType | 'all', string> = {
+    all: '全部操作',
+    'equipment.status.change': '设备状态变更',
+    'equipment.schedule.update': '开放时间更新',
+    'equipment.schedule.exception.add': '例外日期新增',
+    'equipment.schedule.exception.update': '例外日期编辑',
+    'equipment.schedule.exception.remove': '例外日期删除',
+    'holiday.add': '节假日新增',
+    'holiday.remove': '节假日删除',
+    'reservation.approve': '预约审批通过',
+    'reservation.reject': '预约审批驳回',
+    'reservation.cancel': '预约取消',
+    'reservation.modify': '预约修改',
+    'reservation.batch.submit': '批量预约提交',
+    'user.blacklist.toggle': '用户黑名单',
+  };
+
+  const logActionColor: Record<AuditLogActionType, string> = {
+    'equipment.status.change': 'bg-primary-50 text-primary-700 border-primary-200',
+    'equipment.schedule.update': 'bg-primary-50 text-primary-700 border-primary-200',
+    'equipment.schedule.exception.add': 'bg-warning-50 text-warning-700 border-warning-200',
+    'equipment.schedule.exception.update': 'bg-warning-50 text-warning-700 border-warning-200',
+    'equipment.schedule.exception.remove': 'bg-warning-50 text-warning-700 border-warning-200',
+    'holiday.add': 'bg-danger-50 text-danger-700 border-danger-200',
+    'holiday.remove': 'bg-danger-50 text-danger-700 border-danger-200',
+    'reservation.approve': 'bg-success-50 text-success-700 border-success-200',
+    'reservation.reject': 'bg-danger-50 text-danger-700 border-danger-200',
+    'reservation.cancel': 'bg-neutral-50 text-neutral-700 border-neutral-200',
+    'reservation.modify': 'bg-primary-50 text-primary-700 border-primary-200',
+    'reservation.batch.submit': 'bg-primary-50 text-primary-700 border-primary-200',
+    'user.blacklist.toggle': 'bg-danger-50 text-danger-700 border-danger-200',
+  };
+
+  const equipmentDailyStats = useMemo(() => {
+    const today = new Date();
+    return equipments.map((eq) => {
+      const todays = reservations.filter((r) => {
+        if (r.equipmentId !== eq.id) return false;
+        const start = new Date(r.startTime);
+        return isToday(start);
+      });
+      const current = todays.find(
+        (r) => r.status === 'checked-in'
+      );
+      return {
+        equipment: eq,
+        todayCount: todays.length,
+        approvedToday: todays.filter((r) => r.status === 'approved').length,
+        pendingToday: todays.filter((r) => r.status === 'pending').length,
+        currentlyInUse: !!current,
+        currentUser: current ? getUserById(current.userId) : null,
+      };
+    });
+  }, [equipments, reservations]);
+
+  const filteredLogs = useMemo(() => {
+    if (logFilter === 'all') return auditLogs;
+    return auditLogs.filter((l) => l.actionType === logFilter);
+  }, [auditLogs, logFilter]);
 
   const handleApprove = (id: string) => {
     approveReservation(id, '预约已通过，请按时使用。');
@@ -497,13 +569,39 @@ export default function AdminPage() {
       case 'time':
         return (
           <div className="space-y-6">
+            {/* 设备运行看板 */}
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              <div className="card p-4">
+                <p className="text-sm text-neutral-500 mb-1">设备总数</p>
+                <p className="text-2xl font-bold text-neutral-800">{equipments.length}</p>
+              </div>
+              <div className="card p-4">
+                <p className="text-sm text-neutral-500 mb-1">正常开放</p>
+                <p className="text-2xl font-bold text-success-500">
+                  {equipments.filter((e) => e.status === 'available').length}
+                </p>
+              </div>
+              <div className="card p-4">
+                <p className="text-sm text-neutral-500 mb-1">使用中</p>
+                <p className="text-2xl font-bold text-primary-500">
+                  {equipments.filter((e) => e.status === 'in-use').length}
+                </p>
+              </div>
+              <div className="card p-4">
+                <p className="text-sm text-neutral-500 mb-1">维护/停用</p>
+                <p className="text-2xl font-bold text-warning-500">
+                  {equipments.filter((e) => e.status === 'maintenance' || e.status === 'disabled').length}
+                </p>
+              </div>
+            </div>
+
             {/* 设备开放时间设置 */}
             <div className="card p-6">
               <div className="flex items-center justify-between mb-4">
                 <div>
-                  <h3 className="font-semibold text-neutral-800">设备开放时间设置</h3>
+                  <h3 className="font-semibold text-neutral-800">设备运行看板</h3>
                   <p className="text-sm text-neutral-500 mt-1">
-                    为每台设备单独设置每日开放区间、临时闭馆和例外日期
+                    实时查看每台设备状态、今日预约情况，并管理开放规则
                   </p>
                 </div>
                 <button onClick={handleResetData} className="btn-ghost btn-sm text-warning-600 hover:bg-warning-50">
@@ -513,7 +611,7 @@ export default function AdminPage() {
               </div>
 
               <div className="space-y-4">
-                {equipments.map((eq) => {
+                {equipmentDailyStats.map(({ equipment: eq, todayCount, approvedToday, pendingToday, currentlyInUse, currentUser }) => {
                   const schedule = getScheduleByEquipment(eq.id);
                   const defaultOpen = schedule.defaultSchedule.find(
                     (d) => d.dayOfWeek === 1
@@ -524,28 +622,40 @@ export default function AdminPage() {
                       className="p-4 bg-neutral-50 rounded-lg"
                     >
                       <div className="flex flex-col md:flex-row md:items-center gap-4 justify-between">
-                        <div className="flex items-center gap-4">
-                          <div className="w-12 h-12 rounded-lg overflow-hidden bg-neutral-200">
+                        <div className="flex items-start gap-4">
+                          <div className="w-14 h-14 rounded-lg overflow-hidden bg-neutral-200 flex-shrink-0">
                             <img
                               src={eq.image}
                               alt={eq.name}
                               className="w-full h-full object-cover"
                             />
                           </div>
-                          <div>
-                            <div className="flex items-center gap-2">
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2 flex-wrap">
                               <p className="font-medium text-neutral-800">{eq.name}</p>
                               <StatusBadge status={eq.status} />
+                              {currentlyInUse && (
+                                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-primary-50 text-primary-700 text-xs border border-primary-200">
+                                  <Activity className="w-3 h-3 animate-pulse" />
+                                  正在使用 · {currentUser?.name || '未知用户'}
+                                </span>
+                              )}
                             </div>
-                            <p className="text-sm text-neutral-500">{eq.location}</p>
-                            <p className="text-xs text-neutral-400 mt-1">
-                              默认工作日：{defaultOpen?.startTime} - {defaultOpen?.endTime}
+                            <p className="text-sm text-neutral-500 mt-0.5">{eq.location}</p>
+                            <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mt-2">
+                              <span className="text-xs text-neutral-500">
+                                默认工作日：{defaultOpen?.startTime} - {defaultOpen?.endTime}
+                              </span>
+                              <span className="text-xs text-success-600">今日预约：{todayCount} 条</span>
+                              {pendingToday > 0 && (
+                                <span className="text-xs text-warning-600">待审核：{pendingToday} 条</span>
+                              )}
                               {schedule.exceptions.length > 0 && (
-                                <span className="ml-2 text-warning-600">
+                                <span className="text-xs text-warning-600">
                                   · {schedule.exceptions.length} 条例外
                                 </span>
                               )}
-                            </p>
+                            </div>
                           </div>
                         </div>
                         <div className="flex items-center gap-2 flex-wrap">
@@ -974,6 +1084,95 @@ export default function AdminPage() {
                         </tr>
                       );
                     })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        );
+
+      case 'logs':
+        return (
+          <div className="space-y-6">
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+              <div>
+                <h3 className="font-semibold text-neutral-800">操作日志</h3>
+                <p className="text-sm text-neutral-500 mt-1">
+                  记录所有设备状态、开放规则、预约审批、账号管理等关键操作
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-sm text-neutral-500">共 {auditLogs.length} 条记录</span>
+                <select
+                  value={logFilter}
+                  onChange={(e) => setLogFilter(e.target.value as typeof logFilter)}
+                  className="select text-sm"
+                >
+                  {Object.keys(logActionLabel).map((k) => (
+                    <option key={k} value={k}>
+                      {logActionLabel[k as keyof typeof logActionLabel]}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <div className="card overflow-hidden">
+              <div className="overflow-x-auto">
+                <table className="w-full">
+                  <thead className="bg-neutral-50">
+                    <tr>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase">
+                        操作时间
+                      </th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase">
+                        操作类型
+                      </th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase">
+                        操作人
+                      </th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase">
+                        操作对象
+                      </th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase">
+                        详情说明
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-neutral-100">
+                    {filteredLogs.length === 0 && (
+                      <tr>
+                        <td colSpan={5} className="px-4 py-16 text-center text-neutral-400">
+                          <FileText className="w-10 h-10 mx-auto mb-2 opacity-50" />
+                          <p className="text-sm">暂无操作日志</p>
+                        </td>
+                      </tr>
+                    )}
+                    {filteredLogs.map((log) => (
+                      <tr key={log.id} className="hover:bg-neutral-50 transition-colors">
+                        <td className="px-4 py-3 text-sm text-neutral-600 whitespace-nowrap">
+                          {format(new Date(log.createdAt), 'yyyy-MM-dd HH:mm:ss', {
+                            locale: zhCN,
+                          })}
+                        </td>
+                        <td className="px-4 py-3">
+                          <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs border ${logActionColor[log.actionType]}`}>
+                            {logActionLabel[log.actionType]}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 text-sm text-neutral-700">
+                          {log.operatorName}
+                        </td>
+                        <td className="px-4 py-3 text-sm text-neutral-600">
+                          {log.targetName || log.targetId || '-'}
+                        </td>
+                        <td className="px-4 py-3 text-sm text-neutral-600 max-w-xs">
+                          <div className="truncate" title={log.detail}>
+                            {log.detail}
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
                   </tbody>
                 </table>
               </div>

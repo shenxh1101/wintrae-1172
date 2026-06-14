@@ -7,6 +7,7 @@ import {
   Ban,
   Info,
   AlertTriangle,
+  ChevronDown,
 } from 'lucide-react';
 import {
   startOfWeek,
@@ -48,6 +49,7 @@ export default function WeekCalendar({
   const [currentWeekStart, setCurrentWeekStart] = useState(startOfWeek(selectedDate, { weekStartsOn: 1 }));
   const [isSelecting, setIsSelecting] = useState(false);
   const [selectionStart, setSelectionStart] = useState<Date | null>(null);
+  const [hoveredDay, setHoveredDay] = useState<Date | null>(null);
 
   const reservations = useMemo(
     () => getReservationsByEquipment(equipmentId).filter(
@@ -111,6 +113,7 @@ export default function WeekCalendar({
           endMin: 0,
           enabled: false,
           reason: exception.reason || '临时闭馆',
+          description: exception.reason,
           type: 'exception-closed',
         };
       }
@@ -124,6 +127,7 @@ export default function WeekCalendar({
           endMin,
           enabled: true,
           reason: exception.reason || '特殊开放',
+          description: exception.reason,
           type: 'exception-open',
         };
       }
@@ -138,7 +142,7 @@ export default function WeekCalendar({
         endMin: 0,
         enabled: false,
         reason: holidayInfo?.name || '节假日',
-        description: holidayInfo?.description,
+        description: holidayInfo?.description || `${holidayInfo?.name || '节假日'}期间暂停开放`,
         type: 'holiday',
       };
     }
@@ -153,6 +157,7 @@ export default function WeekCalendar({
         endMin: 0,
         enabled: false,
         reason: `${weekDayNames[dayOfWeek]}不开放`,
+        description: `设备每周${weekDayNames[dayOfWeek]}例行不开放`,
         type: 'weekday-closed',
       };
     }
@@ -170,6 +175,18 @@ export default function WeekCalendar({
     };
   };
 
+  // 获取最近的可用替代日期
+  const getNextAvailableDate = (fromDay: Date): string | null => {
+    for (let i = 1; i <= 14; i++) {
+      const checkDay = addDays(fromDay, i);
+      const ds = getDaySchedule(checkDay);
+      if (ds && ds.enabled) {
+        return format(checkDay, 'MM月dd日（E）', { locale: zhCN });
+      }
+    }
+    return null;
+  };
+
   const getDayDisplayInfo = (day: Date) => {
     const daySched = getDaySchedule(day);
     const exception = getExceptionInfo(day);
@@ -180,13 +197,20 @@ export default function WeekCalendar({
     let tipText = '';
     let tipClass = '';
     let tipIcon = null;
+    let fullReason = '';
+    let altDateText: string | null = null;
 
-    if (daySched.enabled) {
+    if (daySched && daySched.enabled) {
       const startStr = `${daySched.startHour.toString().padStart(2, '0')}:${daySched.startMin.toString().padStart(2, '0')}`;
       const endStr = `${daySched.endHour.toString().padStart(2, '0')}:${daySched.endMin.toString().padStart(2, '0')}`;
       windowText = `${startStr} - ${endStr}`;
     } else {
       windowText = '全天关闭';
+    }
+
+    if (!daySched) {
+      windowClass = 'text-neutral-400';
+      return { windowText, windowClass, tipText, tipClass, tipIcon, fullReason, altDateText };
     }
 
     if (daySched.type === 'normal') {
@@ -196,21 +220,33 @@ export default function WeekCalendar({
       tipText = exception?.reason || '特殊开放时段';
       tipClass = 'text-warning-600';
       tipIcon = Info;
+      fullReason = daySched.description || '特殊开放';
     } else if (daySched.type === 'exception-closed') {
       windowClass = 'text-danger-500';
       tipText = exception?.reason || '临时闭馆';
       tipClass = 'text-danger-600';
       tipIcon = AlertTriangle;
+      fullReason = daySched.description || '临时闭馆';
+      altDateText = getNextAvailableDate(day);
     } else if (daySched.type === 'holiday') {
       windowClass = 'text-danger-500';
       tipText = holidayInfo?.name || '节假日';
       tipClass = 'text-danger-600';
       tipIcon = AlertTriangle;
+      fullReason = daySched.description || `${holidayInfo?.name || '节假日'}期间暂停开放`;
+      altDateText = getNextAvailableDate(day);
+    } else if (daySched.type === 'weekday-closed') {
+      windowClass = 'text-neutral-400';
+      tipText = daySched.reason;
+      tipClass = 'text-neutral-500';
+      tipIcon = Info;
+      fullReason = daySched.description || '例行不开放';
+      altDateText = getNextAvailableDate(day);
     } else {
       windowClass = 'text-neutral-400';
     }
 
-    return { windowText, windowClass, tipText, tipClass, tipIcon };
+    return { windowText, windowClass, tipText, tipClass, tipIcon, fullReason, altDateText };
   };
 
   const isWithinOperatingHours = (day: Date, hour: number): boolean => {
@@ -222,6 +258,28 @@ export default function WeekCalendar({
     const shiftEnd = setMinutes(setHours(day, daySched.endHour), daySched.endMin);
 
     return slotStart >= shiftStart && slotStart < shiftEnd;
+  };
+
+  const getSlotReasonText = (day: Date, hour: number): string => {
+    const daySched = getDaySchedule(day);
+    if (!daySched) return '无时间表配置';
+    if (daySched.type === 'holiday') {
+      const h = getHolidayInfo(day);
+      return `节假日关闭：${h?.name || ''}${h?.description ? ' - ' + h.description : ''}`;
+    }
+    if (daySched.type === 'exception-closed') {
+      return `临时闭馆：${daySched.description || '设备维护或特殊安排'}`;
+    }
+    if (daySched.type === 'weekday-closed') {
+      return daySched.description || '该日期每周固定不开放';
+    }
+    if (!daySched.enabled) {
+      return '该日不开放';
+    }
+    // 开放但不在时段内
+    const startStr = `${daySched.startHour.toString().padStart(2, '0')}:${daySched.startMin.toString().padStart(2, '0')}`;
+    const endStr = `${daySched.endHour.toString().padStart(2, '0')}:${daySched.endMin.toString().padStart(2, '0')}`;
+    return `该日开放时段为 ${startStr} - ${endStr}`;
   };
 
   const getReservationForSlot = (day: Date, hour: number): Reservation | undefined => {
@@ -367,12 +425,16 @@ export default function WeekCalendar({
               const holiday = isHoliday(day);
               const info = getDayDisplayInfo(day);
               const TipIcon = info.tipIcon;
+              const showDetail = hoveredDay && format(hoveredDay, 'yyyy-MM-dd') === format(day, 'yyyy-MM-dd');
+
               return (
                 <div
                   key={day.toISOString()}
-                  className={`p-2 text-center border-l border-neutral-100 first:border-l-0 ${
+                  className={`p-2 text-center border-l border-neutral-100 first:border-l-0 relative ${
                     isToday(day) ? 'bg-primary-50/50' : ''
                   } ${holiday ? 'bg-danger-50/30' : ''}`}
+                  onMouseEnter={() => setHoveredDay(day)}
+                  onMouseLeave={() => setHoveredDay(null)}
                 >
                   <p className={`text-xs mb-0.5 ${
                     holiday ? 'text-danger-500' : 'text-neutral-500'
@@ -393,10 +455,30 @@ export default function WeekCalendar({
                   </div>
                   {/* 说明提示 */}
                   {info.tipText && (
-                    <div className={`mt-0.5 text-[10px] flex items-center justify-center gap-0.5 ${info.tipClass}`}
-                      title={info.tipText}>
+                    <div
+                      className={`mt-0.5 text-[10px] flex items-center justify-center gap-0.5 ${info.tipClass}`}
+                      title={info.fullReason}
+                    >
                       {TipIcon && <TipIcon className="w-2.5 h-2.5" />}
                       <span className="truncate max-w-full">{info.tipText}</span>
+                    </div>
+                  )}
+                  {/* hover 展开详细信息 */}
+                  {showDetail && info.fullReason && (
+                    <div className="absolute z-30 left-1 right-1 top-full mt-1 p-2.5 bg-white rounded-lg shadow-lg border border-neutral-200 text-left animate-in fade-in slide-in-from-top-1">
+                      <p className="text-xs font-medium text-neutral-700 mb-1 flex items-center gap-1">
+                        {TipIcon && <TipIcon className="w-3 h-3" />}
+                        规则说明
+                      </p>
+                      <p className="text-xs text-neutral-600">{info.fullReason}</p>
+                      {info.altDateText && (
+                        <div className="mt-1.5 pt-1.5 border-t border-neutral-100 flex items-start gap-1">
+                          <Info className="w-3 h-3 text-success-500 mt-0.5 flex-shrink-0" />
+                          <p className="text-xs text-success-600">
+                            最近可约：<span className="font-medium">{info.altDateText}</span>
+                          </p>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -416,6 +498,8 @@ export default function WeekCalendar({
                 {weekDays.map((day) => {
                   const status = getSlotStatus(day, hour);
                   const slotClass = getSlotClass(status);
+                  const disabled = status !== 'available' && status !== 'selected';
+                  const reasonText = disabled ? getSlotReasonText(day, hour) : '';
 
                   return (
                     <div
@@ -423,6 +507,7 @@ export default function WeekCalendar({
                       className={`h-10 border-l border-neutral-50 transition-colors relative ${slotClass}`}
                       onMouseDown={() => handleSlotMouseDown(day, hour)}
                       onMouseEnter={() => handleSlotMouseEnter(day, hour)}
+                      title={reasonText || '点击选择该时段'}
                     >
                       {status === 'reserved' && (
                         <div className="absolute inset-0.5 rounded bg-primary-500 text-white text-xs px-1.5 py-0.5 overflow-hidden">
@@ -430,12 +515,14 @@ export default function WeekCalendar({
                         </div>
                       )}
                       {(status === 'closed' || status === 'holiday' || status === 'exception-closed') && (
-                        <div className="absolute inset-0 flex items-center justify-center">
-                          <Ban className={`w-3 h-3 ${
-                            status === 'holiday' ? 'text-danger-300' :
-                            status === 'exception-closed' ? 'text-warning-300' :
-                            'text-neutral-300'
-                          }`} />
+                        <div className="absolute inset-0 flex items-center justify-center group">
+                          <Ban
+                            className={`w-3 h-3 ${
+                              status === 'holiday' ? 'text-danger-300' :
+                              status === 'exception-closed' ? 'text-warning-300' :
+                              'text-neutral-300'
+                            }`}
+                          />
                         </div>
                       )}
                     </div>
@@ -477,6 +564,10 @@ export default function WeekCalendar({
         <div className="flex items-center gap-2">
           <div className="w-3 h-3 rounded bg-warning-100" />
           <span className="text-xs text-neutral-500">临时闭馆</span>
+        </div>
+        <div className="flex items-center gap-1 text-xs text-neutral-400 ml-auto">
+          <Info className="w-3 h-3" />
+          悬停日期头查看完整规则说明和最近可约日
         </div>
       </div>
     </div>
