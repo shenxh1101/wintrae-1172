@@ -13,13 +13,18 @@ import {
   Plus,
   Trash2,
   Eye,
+  Settings,
+  CalendarOff,
+  Calendar,
+  RefreshCw,
 } from 'lucide-react';
-import { format, startOfMonth, endOfMonth, eachDayOfInterval } from 'date-fns';
+import { format, startOfMonth, endOfMonth, eachDayOfInterval, parseISO } from 'date-fns';
 import { zhCN } from 'date-fns/locale';
 import { useAppStore } from '@/store/useAppStore';
 import StatusBadge from '@/components/StatusBadge';
 import Modal from '@/components/Modal';
 import Tabs from '@/components/Tabs';
+import type { DaySchedule, Holiday, ScheduleException } from '@/types';
 
 const sideMenuItems = [
   { key: 'review', label: '预约审核', icon: ClipboardCheck },
@@ -35,13 +40,22 @@ export default function AdminPage() {
     users,
     equipments,
     notifications,
+    schedules,
+    holidays,
     getEquipmentById,
     getUserById,
+    getScheduleByEquipment,
     approveReservation,
     rejectReservation,
     toggleUserBlacklist,
     addNotification,
     updateEquipmentStatus,
+    updateEquipmentSchedule,
+    addScheduleException,
+    removeScheduleException,
+    addHoliday,
+    removeHoliday,
+    resetToDefault,
   } = useAppStore();
 
   const [activeSection, setActiveSection] = useState('review');
@@ -56,6 +70,95 @@ export default function AdminPage() {
   const [notifStartDate, setNotifStartDate] = useState('');
   const [notifEndDate, setNotifEndDate] = useState('');
   const [viewingReservation, setViewingReservation] = useState<string | null>(null);
+
+  // 时间表编辑弹窗
+  const [showScheduleModal, setShowScheduleModal] = useState(false);
+  const [editingEquipmentId, setEditingEquipmentId] = useState<string | null>(null);
+  const [editingSchedule, setEditingSchedule] = useState<DaySchedule[]>([]);
+  const [showExceptionModal, setShowExceptionModal] = useState(false);
+  const [exceptionEquipmentId, setExceptionEquipmentId] = useState<string | null>(null);
+  const [exceptionDate, setExceptionDate] = useState('');
+  const [exceptionEnabled, setExceptionEnabled] = useState(false);
+  const [exceptionStartTime, setExceptionStartTime] = useState('');
+  const [exceptionEndTime, setExceptionEndTime] = useState('');
+  const [exceptionReason, setExceptionReason] = useState('');
+
+  // 节假日管理
+  const [showHolidayModal, setShowHolidayModal] = useState(false);
+  const [holidayName, setHolidayName] = useState('');
+  const [holidayStartDate, setHolidayStartDate] = useState('');
+  const [holidayEndDate, setHolidayEndDate] = useState('');
+  const [holidayDescription, setHolidayDescription] = useState('');
+
+  const weekDayNames = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+
+  const openScheduleModal = (equipmentId: string) => {
+    const schedule = getScheduleByEquipment(equipmentId);
+    setEditingEquipmentId(equipmentId);
+    setEditingSchedule(JSON.parse(JSON.stringify(schedule.defaultSchedule)));
+    setShowScheduleModal(true);
+  };
+
+  const handleSaveSchedule = () => {
+    if (!editingEquipmentId) return;
+    updateEquipmentSchedule(editingEquipmentId, { defaultSchedule: editingSchedule });
+    setShowScheduleModal(false);
+    setEditingEquipmentId(null);
+  };
+
+  const updateDaySchedule = (dayOfWeek: number, field: keyof DaySchedule, value: any) => {
+    setEditingSchedule(
+      editingSchedule.map((d) =>
+        d.dayOfWeek === dayOfWeek ? { ...d, [field]: value } : d
+      )
+    );
+  };
+
+  const openExceptionModal = (equipmentId: string) => {
+    setExceptionEquipmentId(equipmentId);
+    setExceptionDate('');
+    setExceptionEnabled(false);
+    setExceptionStartTime('');
+    setExceptionEndTime('');
+    setExceptionReason('');
+    setShowExceptionModal(true);
+  };
+
+  const handleAddException = () => {
+    if (!exceptionEquipmentId || !exceptionDate) return;
+
+    addScheduleException(exceptionEquipmentId, {
+      date: exceptionDate,
+      enabled: exceptionEnabled,
+      startTime: exceptionStartTime || undefined,
+      endTime: exceptionEndTime || undefined,
+      reason: exceptionReason || undefined,
+      type: 'temporary',
+    });
+    setShowExceptionModal(false);
+  };
+
+  const handleAddHoliday = () => {
+    if (!holidayName || !holidayStartDate || !holidayEndDate) return;
+
+    addHoliday({
+      name: holidayName,
+      startDate: holidayStartDate,
+      endDate: holidayEndDate,
+      description: holidayDescription || undefined,
+    });
+    setShowHolidayModal(false);
+    setHolidayName('');
+    setHolidayStartDate('');
+    setHolidayEndDate('');
+    setHolidayDescription('');
+  };
+
+  const handleResetData = () => {
+    if (confirm('确定要重置所有数据为默认状态吗？此操作不可恢复！')) {
+      resetToDefault();
+    }
+  };
 
   // 待审核预约
   const pendingReservations = useMemo(
@@ -363,81 +466,194 @@ export default function AdminPage() {
       case 'time':
         return (
           <div className="space-y-6">
+            {/* 设备开放时间设置 */}
             <div className="card p-6">
-              <h3 className="font-semibold text-neutral-800 mb-4">设备开放时间设置</h3>
-              <p className="text-sm text-neutral-500 mb-6">
-                设置各设备的每日开放时间，以及节假日闭馆安排。
-              </p>
+              <div className="flex items-center justify-between mb-4">
+                <div>
+                  <h3 className="font-semibold text-neutral-800">设备开放时间设置</h3>
+                  <p className="text-sm text-neutral-500 mt-1">
+                    为每台设备单独设置每日开放区间、临时闭馆和例外日期
+                  </p>
+                </div>
+                <button onClick={handleResetData} className="btn-ghost btn-sm text-warning-600 hover:bg-warning-50">
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  重置默认数据
+                </button>
+              </div>
 
               <div className="space-y-4">
-                {equipments.map((eq) => (
-                  <div
-                    key={eq.id}
-                    className="flex items-center justify-between p-4 bg-neutral-50 rounded-lg"
-                  >
-                    <div className="flex items-center gap-4">
-                      <div className="w-12 h-12 rounded-lg overflow-hidden bg-neutral-200">
-                        <img
-                          src={eq.image}
-                          alt={eq.name}
-                          className="w-full h-full object-cover"
-                        />
+                {equipments.map((eq) => {
+                  const schedule = getScheduleByEquipment(eq.id);
+                  const defaultOpen = schedule.defaultSchedule.find(
+                    (d) => d.dayOfWeek === 1
+                  );
+                  return (
+                    <div
+                      key={eq.id}
+                      className="p-4 bg-neutral-50 rounded-lg"
+                    >
+                      <div className="flex flex-col md:flex-row md:items-center gap-4 justify-between">
+                        <div className="flex items-center gap-4">
+                          <div className="w-12 h-12 rounded-lg overflow-hidden bg-neutral-200">
+                            <img
+                              src={eq.image}
+                              alt={eq.name}
+                              className="w-full h-full object-cover"
+                            />
+                          </div>
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <p className="font-medium text-neutral-800">{eq.name}</p>
+                              <StatusBadge status={eq.status} />
+                            </div>
+                            <p className="text-sm text-neutral-500">{eq.location}</p>
+                            <p className="text-xs text-neutral-400 mt-1">
+                              默认工作日：{defaultOpen?.startTime} - {defaultOpen?.endTime}
+                              {schedule.exceptions.length > 0 && (
+                                <span className="ml-2 text-warning-600">
+                                  · {schedule.exceptions.length} 条例外
+                                </span>
+                              )}
+                            </p>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <select
+                            value={eq.status}
+                            onChange={(e) =>
+                              updateEquipmentStatus(
+                                eq.id,
+                                e.target.value as typeof eq.status
+                              )
+                            }
+                            className="select min-w-[120px] text-sm"
+                          >
+                            <option value="available">正常开放</option>
+                            <option value="maintenance">维护中</option>
+                            <option value="disabled">已停用</option>
+                          </select>
+                          <button
+                            onClick={() => openScheduleModal(eq.id)}
+                            className="btn-secondary btn-sm"
+                          >
+                            <Settings className="w-3.5 h-3.5" />
+                            设置开放时间
+                          </button>
+                          <button
+                            onClick={() => openExceptionModal(eq.id)}
+                            className="btn-secondary btn-sm"
+                          >
+                            <CalendarOff className="w-3.5 h-3.5" />
+                            添加例外
+                          </button>
+                        </div>
                       </div>
-                      <div>
-                        <p className="font-medium text-neutral-800">{eq.name}</p>
-                        <p className="text-sm text-neutral-500">{eq.location}</p>
-                      </div>
+
+                      {/* 例外日期列表 */}
+                      {schedule.exceptions.length > 0 && (
+                        <div className="mt-4 pt-4 border-t border-neutral-200">
+                          <p className="text-xs font-medium text-neutral-600 mb-2">例外日期：</p>
+                          <div className="flex flex-wrap gap-2">
+                            {schedule.exceptions.map((exc) => (
+                              <div
+                                key={exc.id}
+                                className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs ${
+                                  exc.enabled
+                                    ? 'bg-success-50 text-success-700 border border-success-200'
+                                    : 'bg-danger-50 text-danger-700 border border-danger-200'
+                                }`}
+                              >
+                                <Calendar className="w-3 h-3" />
+                                <span>{exc.date}</span>
+                                {exc.reason && <span>· {exc.reason}</span>}
+                                <button
+                                  onClick={() => removeScheduleException(eq.id, exc.id)}
+                                  className="p-0.5 rounded-full hover:bg-white/50 transition-colors"
+                                >
+                                  <X className="w-3 h-3" />
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
                     </div>
-                    <div className="flex items-center gap-4">
-                      <div className="text-sm">
-                        <span className="text-neutral-500">开放时间：</span>
-                        <span className="font-medium text-neutral-700">
-                          08:00 - 20:00
-                        </span>
-                      </div>
-                      <select
-                        value={eq.status}
-                        onChange={(e) =>
-                          updateEquipmentStatus(
-                            eq.id,
-                            e.target.value as typeof eq.status
-                          )
-                        }
-                        className="select min-w-[120px]"
-                      >
-                        <option value="available">正常开放</option>
-                        <option value="maintenance">维护中</option>
-                        <option value="disabled">已停用</option>
-                      </select>
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
 
+            {/* 节假日管理 */}
             <div className="card p-6">
-              <h3 className="font-semibold text-neutral-800 mb-4">节假日闭馆设置</h3>
-              <div className="flex items-end gap-4">
+              <div className="flex items-center justify-between mb-4">
                 <div>
-                  <label className="block text-sm font-medium text-neutral-700 mb-1.5">
-                    开始日期
-                  </label>
-                  <input type="date" className="input" />
+                  <h3 className="font-semibold text-neutral-800">节假日闭馆设置</h3>
+                  <p className="text-sm text-neutral-500 mt-1">
+                    节假日期间所有设备自动停止预约
+                  </p>
                 </div>
-                <div>
-                  <label className="block text-sm font-medium text-neutral-700 mb-1.5">
-                    结束日期
-                  </label>
-                  <input type="date" className="input" />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-neutral-700 mb-1.5">
-                    闭馆原因
-                  </label>
-                  <input type="text" placeholder="如：春节放假" className="input" />
-                </div>
-                <button className="btn-primary">添加</button>
+                <button onClick={() => setShowHolidayModal(true)} className="btn-primary">
+                  <Plus className="w-4 h-4" />
+                  添加节假日
+                </button>
               </div>
+
+              {holidays.length > 0 ? (
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                  {holidays.map((holiday) => (
+                    <div
+                      key={holiday.id}
+                      className="flex items-center justify-between p-3 bg-danger-50 border border-danger-100 rounded-lg"
+                    >
+                      <div className="flex items-center gap-3">
+                        <div className="w-8 h-8 rounded-lg bg-danger-100 flex items-center justify-center">
+                          <CalendarOff className="w-4 h-4 text-danger-600" />
+                        </div>
+                        <div>
+                          <p className="font-medium text-danger-800 text-sm">{holiday.name}</p>
+                          <p className="text-xs text-danger-600">
+                            {holiday.startDate} ~ {holiday.endDate}
+                          </p>
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => removeHoliday(holiday.id)}
+                        className="p-1.5 rounded-lg hover:bg-danger-100 transition-colors"
+                      >
+                        <Trash2 className="w-3.5 h-3.5 text-danger-500" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="text-center py-8 text-neutral-400">
+                  <CalendarOff className="w-10 h-10 mx-auto mb-2 opacity-50" />
+                  <p className="text-sm">暂无节假日设置</p>
+                </div>
+              )}
+            </div>
+
+            {/* 规则说明 */}
+            <div className="card p-4 bg-neutral-50 border border-neutral-200">
+              <h4 className="font-medium text-neutral-700 mb-2">规则说明</h4>
+              <ul className="text-sm text-neutral-600 space-y-1">
+                <li className="flex items-start gap-2">
+                  <span className="w-1.5 h-1.5 rounded-full bg-primary-500 mt-1.5 flex-shrink-0" />
+                  <span><strong>优先级</strong>：节假日 {'>'} 临时例外 {'>'} 周时间表</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <span className="w-1.5 h-1.5 rounded-full bg-primary-500 mt-1.5 flex-shrink-0" />
+                  <span><strong>节假日</strong>：全天所有设备不可预约，优先级最高</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <span className="w-1.5 h-1.5 rounded-full bg-primary-500 mt-1.5 flex-shrink-0" />
+                  <span><strong>临时例外</strong>：针对单台设备的单日特殊安排，可设置闭馆或特殊开放时段</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <span className="w-1.5 h-1.5 rounded-full bg-primary-500 mt-1.5 flex-shrink-0" />
+                  <span><strong>周时间表</strong>：常规的每周开放时段，每台设备独立配置</span>
+                </li>
+              </ul>
             </div>
           </div>
         );
@@ -1024,6 +1240,271 @@ export default function AdminPage() {
               className="btn-primary"
             >
               发布
+            </button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* 时间表编辑弹窗 */}
+      <Modal
+        isOpen={showScheduleModal}
+        onClose={() => setShowScheduleModal(false)}
+        title="设置开放时间"
+        size="lg"
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-neutral-500">
+            设置每周各天的开放时间，关闭开关表示当天不开放
+          </p>
+
+          <div className="space-y-3">
+            {editingSchedule.map((day) => (
+              <div
+                key={day.dayOfWeek}
+                className={`flex items-center gap-4 p-3 rounded-lg transition-colors ${
+                  day.enabled ? 'bg-primary-50/50' : 'bg-neutral-50'
+                }`}
+              >
+                <div className="w-20 flex-shrink-0">
+                  <span className={`font-medium ${day.enabled ? 'text-primary-700' : 'text-neutral-500'}`}>
+                    {weekDayNames[day.dayOfWeek]}
+                  </span>
+                </div>
+
+                <label className="relative inline-flex items-center cursor-pointer flex-shrink-0">
+                  <input
+                    type="checkbox"
+                    checked={day.enabled}
+                    onChange={(e) => updateDaySchedule(day.dayOfWeek, 'enabled', e.target.checked)}
+                    className="sr-only peer"
+                  />
+                  <div className="w-11 h-6 bg-neutral-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-primary-100 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-neutral-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary-500"></div>
+                </label>
+
+                {day.enabled && (
+                  <>
+                    <select
+                      value={day.startTime}
+                      onChange={(e) => updateDaySchedule(day.dayOfWeek, 'startTime', e.target.value)}
+                      className="select flex-1 max-w-[120px]"
+                    >
+                      {Array.from({ length: 13 }, (_, i) => i + 7).map((hour) => (
+                        <option key={hour} value={`${hour.toString().padStart(2, '0')}:00`}>
+                          {hour.toString().padStart(2, '0')}:00
+                        </option>
+                      ))}
+                    </select>
+                    <span className="text-neutral-400 flex-shrink-0">至</span>
+                    <select
+                      value={day.endTime}
+                      onChange={(e) => updateDaySchedule(day.dayOfWeek, 'endTime', e.target.value)}
+                      className="select flex-1 max-w-[120px]"
+                    >
+                      {Array.from({ length: 13 }, (_, i) => i + 8).map((hour) => (
+                        <option key={hour} value={`${hour.toString().padStart(2, '0')}:00`}>
+                          {hour.toString().padStart(2, '0')}:00
+                        </option>
+                      ))}
+                    </select>
+                  </>
+                )}
+
+                {!day.enabled && (
+                  <span className="text-sm text-neutral-400">全天关闭</span>
+                )}
+              </div>
+            ))}
+          </div>
+
+          <div className="flex justify-end gap-3 pt-4 border-t border-neutral-100">
+            <button onClick={() => setShowScheduleModal(false)} className="btn-secondary">
+              取消
+            </button>
+            <button onClick={handleSaveSchedule} className="btn-primary">
+              保存设置
+            </button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* 例外日期弹窗 */}
+      <Modal
+        isOpen={showExceptionModal}
+        onClose={() => setShowExceptionModal(false)}
+        title="添加例外日期"
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-neutral-500">
+            设置单日的特殊开放安排，优先级高于周时间表
+          </p>
+
+          <div>
+            <label className="block text-sm font-medium text-neutral-700 mb-1.5">
+              日期
+            </label>
+            <input
+              type="date"
+              value={exceptionDate}
+              onChange={(e) => setExceptionDate(e.target.value)}
+              min={format(new Date(), 'yyyy-MM-dd')}
+              className="input"
+            />
+          </div>
+
+          <div className="flex items-center gap-3">
+            <label className="relative inline-flex items-center cursor-pointer">
+              <input
+                type="checkbox"
+                checked={exceptionEnabled}
+                onChange={(e) => setExceptionEnabled(e.target.checked)}
+                className="sr-only peer"
+              />
+              <div className="w-11 h-6 bg-neutral-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-primary-100 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-neutral-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary-500"></div>
+            </label>
+            <span className="text-sm text-neutral-700">
+              {exceptionEnabled ? '当天特殊开放' : '当天闭馆'}
+            </span>
+          </div>
+
+          {exceptionEnabled && (
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-medium text-neutral-700 mb-1.5">
+                  开始时间
+                </label>
+                <select
+                  value={exceptionStartTime}
+                  onChange={(e) => setExceptionStartTime(e.target.value)}
+                  className="select"
+                >
+                  <option value="">请选择</option>
+                  {Array.from({ length: 13 }, (_, i) => i + 7).map((hour) => (
+                    <option key={hour} value={`${hour.toString().padStart(2, '0')}:00`}>
+                      {hour.toString().padStart(2, '0')}:00
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-neutral-700 mb-1.5">
+                  结束时间
+                </label>
+                <select
+                  value={exceptionEndTime}
+                  onChange={(e) => setExceptionEndTime(e.target.value)}
+                  className="select"
+                >
+                  <option value="">请选择</option>
+                  {Array.from({ length: 13 }, (_, i) => i + 8).map((hour) => (
+                    <option key={hour} value={`${hour.toString().padStart(2, '0')}:00`}>
+                      {hour.toString().padStart(2, '0')}:00
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+          )}
+
+          <div>
+            <label className="block text-sm font-medium text-neutral-700 mb-1.5">
+              原因说明（可选）
+            </label>
+            <input
+              type="text"
+              value={exceptionReason}
+              onChange={(e) => setExceptionReason(e.target.value)}
+              placeholder="如：设备检修、临时活动等"
+              className="input"
+            />
+          </div>
+
+          <div className="flex justify-end gap-3 pt-2">
+            <button onClick={() => setShowExceptionModal(false)} className="btn-secondary">
+              取消
+            </button>
+            <button
+              onClick={handleAddException}
+              disabled={!exceptionDate}
+              className="btn-primary"
+            >
+              添加
+            </button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* 节假日弹窗 */}
+      <Modal
+        isOpen={showHolidayModal}
+        onClose={() => setShowHolidayModal(false)}
+        title="添加节假日"
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-neutral-500">
+            节假日期间所有设备全天不可预约
+          </p>
+
+          <div>
+            <label className="block text-sm font-medium text-neutral-700 mb-1.5">
+              节假日名称
+            </label>
+            <input
+              type="text"
+              value={holidayName}
+              onChange={(e) => setHolidayName(e.target.value)}
+              placeholder="如：元旦、春节、劳动节等"
+              className="input"
+            />
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm font-medium text-neutral-700 mb-1.5">
+                开始日期
+              </label>
+              <input
+                type="date"
+                value={holidayStartDate}
+                onChange={(e) => setHolidayStartDate(e.target.value)}
+                className="input"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-neutral-700 mb-1.5">
+                结束日期
+              </label>
+              <input
+                type="date"
+                value={holidayEndDate}
+                onChange={(e) => setHolidayEndDate(e.target.value)}
+                className="input"
+              />
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-neutral-700 mb-1.5">
+              描述说明（可选）
+            </label>
+            <textarea
+              value={holidayDescription}
+              onChange={(e) => setHolidayDescription(e.target.value)}
+              placeholder="节假日放假安排说明..."
+              rows={3}
+              className="textarea"
+            />
+          </div>
+
+          <div className="flex justify-end gap-3 pt-2">
+            <button onClick={() => setShowHolidayModal(false)} className="btn-secondary">
+              取消
+            </button>
+            <button
+              onClick={handleAddHoliday}
+              disabled={!holidayName || !holidayStartDate || !holidayEndDate}
+              className="btn-primary"
+            >
+              添加
             </button>
           </div>
         </div>

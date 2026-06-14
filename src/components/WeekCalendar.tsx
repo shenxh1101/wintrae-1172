@@ -4,21 +4,19 @@ import {
   ChevronRight,
   Calendar as CalendarIcon,
   Clock,
+  Ban,
 } from 'lucide-react';
 import {
-  startOfMonth,
-  endOfMonth,
   startOfWeek,
-  endOfWeek,
   addDays,
-  addMonths,
-  subMonths,
   format,
-  isSameMonth,
-  isSameDay,
   isToday,
   setHours,
   setMinutes,
+  isWithinInterval,
+  startOfDay,
+  endOfDay,
+  parseISO,
 } from 'date-fns';
 import { zhCN } from 'date-fns/locale';
 import { useAppStore } from '@/store/useAppStore';
@@ -31,7 +29,7 @@ interface WeekCalendarProps {
   selectedSlot?: { start: Date; end: Date } | null;
 }
 
-const HOURS = Array.from({ length: 12 }, (_, i) => i + 8);
+const HOURS = Array.from({ length: 14 }, (_, i) => i + 7);
 
 export default function WeekCalendar({
   selectedDate,
@@ -39,7 +37,11 @@ export default function WeekCalendar({
   onSelectSlot,
   selectedSlot,
 }: WeekCalendarProps) {
-  const { getReservationsByEquipment } = useAppStore();
+  const {
+    getReservationsByEquipment,
+    getScheduleByEquipment,
+    holidays,
+  } = useAppStore();
   const [currentWeekStart, setCurrentWeekStart] = useState(startOfWeek(selectedDate, { weekStartsOn: 1 }));
   const [isSelecting, setIsSelecting] = useState(false);
   const [selectionStart, setSelectionStart] = useState<Date | null>(null);
@@ -49,6 +51,11 @@ export default function WeekCalendar({
       (r) => r.status !== 'cancelled' && r.status !== 'rejected'
     ),
     [getReservationsByEquipment, equipmentId]
+  );
+
+  const schedule = useMemo(
+    () => getScheduleByEquipment(equipmentId),
+    [getScheduleByEquipment, equipmentId]
   );
 
   const weekDays = useMemo(() => {
@@ -66,6 +73,65 @@ export default function WeekCalendar({
 
   const goToToday = () => {
     setCurrentWeekStart(startOfWeek(new Date(), { weekStartsOn: 1 }));
+  };
+
+  const isHoliday = (day: Date): boolean => {
+    return holidays.some((h) =>
+      isWithinInterval(day, {
+        start: startOfDay(parseISO(h.startDate)),
+        end: endOfDay(parseISO(h.endDate)),
+      })
+    );
+  };
+
+  const getDaySchedule = (day: Date) => {
+    if (!schedule) return null;
+
+    const dateStr = format(day, 'yyyy-MM-dd');
+    const exception = schedule.exceptions.find((e) => e.date === dateStr);
+
+    if (exception) {
+      if (!exception.enabled) return null;
+      if (exception.startTime && exception.endTime) {
+        const [startHour, startMin] = exception.startTime.split(':').map(Number);
+        const [endHour, endMin] = exception.endTime.split(':').map(Number);
+        return {
+          startHour,
+          startMin,
+          endHour,
+          endMin,
+          enabled: true,
+        };
+      }
+    }
+
+    if (isHoliday(day)) return null;
+
+    const dayOfWeek = day.getDay();
+    const daySchedule = schedule.defaultSchedule.find((d) => d.dayOfWeek === dayOfWeek);
+    if (!daySchedule || !daySchedule.enabled) return null;
+
+    const [startHour, startMin] = daySchedule.startTime.split(':').map(Number);
+    const [endHour, endMin] = daySchedule.endTime.split(':').map(Number);
+
+    return {
+      startHour,
+      startMin,
+      endHour,
+      endMin,
+      enabled: true,
+    };
+  };
+
+  const isWithinOperatingHours = (day: Date, hour: number): boolean => {
+    const daySched = getDaySchedule(day);
+    if (!daySched) return false;
+
+    const slotStart = setMinutes(setHours(day, hour), 0);
+    const shiftStart = setMinutes(setHours(day, daySched.startHour), daySched.startMin);
+    const shiftEnd = setMinutes(setHours(day, daySched.endHour), daySched.endMin);
+
+    return slotStart >= shiftStart && slotStart < shiftEnd;
   };
 
   const getReservationForSlot = (day: Date, hour: number): Reservation | undefined => {
@@ -93,9 +159,15 @@ export default function WeekCalendar({
     );
   };
 
-  const handleSlotMouseDown = (day: Date, hour: number) => {
+  const isSlotDisabled = (day: Date, hour: number): boolean => {
     const reservation = getReservationForSlot(day, hour);
-    if (reservation) return;
+    const isPast = isPastHour(day, hour);
+    const isClosed = !isWithinOperatingHours(day, hour);
+    return !!reservation || isPast || isClosed;
+  };
+
+  const handleSlotMouseDown = (day: Date, hour: number) => {
+    if (isSlotDisabled(day, hour)) return;
 
     const start = setMinutes(setHours(day, hour), 0);
     setIsSelecting(true);
@@ -105,9 +177,7 @@ export default function WeekCalendar({
 
   const handleSlotMouseEnter = (day: Date, hour: number) => {
     if (!isSelecting || !selectionStart) return;
-
-    const reservation = getReservationForSlot(day, hour);
-    if (reservation) return;
+    if (isSlotDisabled(day, hour)) return;
 
     const current = setMinutes(setHours(day, hour + 1), 0);
     const start = selectionStart < current ? selectionStart : current;
@@ -124,6 +194,38 @@ export default function WeekCalendar({
   const isPastHour = (day: Date, hour: number): boolean => {
     const slotTime = setMinutes(setHours(day, hour), 0);
     return slotTime < new Date();
+  };
+
+  const getSlotStatus = (day: Date, hour: number) => {
+    const reservation = getReservationForSlot(day, hour);
+    const isPast = isPastHour(day, hour);
+    const isClosed = !isWithinOperatingHours(day, hour);
+    const isSelected = isSlotSelected(day, hour);
+    const holiday = isHoliday(day);
+
+    if (reservation) return 'reserved';
+    if (isPast) return 'past';
+    if (holiday) return 'holiday';
+    if (isClosed) return 'closed';
+    if (isSelected) return 'selected';
+    return 'available';
+  };
+
+  const getSlotClass = (status: string) => {
+    switch (status) {
+      case 'reserved':
+        return 'bg-primary-100/70 cursor-not-allowed';
+      case 'past':
+        return 'bg-neutral-50 cursor-not-allowed';
+      case 'closed':
+        return 'bg-neutral-100/80 cursor-not-allowed';
+      case 'holiday':
+        return 'bg-danger-50 cursor-not-allowed';
+      case 'selected':
+        return 'bg-primary-500/25';
+      default:
+        return 'hover:bg-primary-50 cursor-pointer';
+    }
   };
 
   return (
@@ -165,25 +267,32 @@ export default function WeekCalendar({
             <div className="p-3 text-center text-xs text-neutral-400 font-medium">
               <Clock className="w-4 h-4 mx-auto" />
             </div>
-            {weekDays.map((day) => (
-              <div
-                key={day.toISOString()}
-                className={`p-3 text-center border-l border-neutral-100 first:border-l-0 ${
-                  isToday(day) ? 'bg-primary-50/50' : ''
-                }`}
-              >
-                <p className="text-xs text-neutral-500 mb-0.5">
-                  {format(day, 'EEE', { locale: zhCN })}
-                </p>
-                <p
-                  className={`text-base font-semibold ${
-                    isToday(day) ? 'text-primary-600' : 'text-neutral-800'
-                  }`}
+            {weekDays.map((day) => {
+              const holiday = isHoliday(day);
+              return (
+                <div
+                  key={day.toISOString()}
+                  className={`p-3 text-center border-l border-neutral-100 first:border-l-0 ${
+                    isToday(day) ? 'bg-primary-50/50' : ''
+                  } ${holiday ? 'bg-danger-50/30' : ''}`}
                 >
-                  {format(day, 'd')}
-                </p>
-              </div>
-            ))}
+                  <p className={`text-xs mb-0.5 ${
+                    holiday ? 'text-danger-500' : 'text-neutral-500'
+                  }`}>
+                    {format(day, 'EEE', { locale: zhCN })}
+                    {holiday && ' · 节假日'}
+                  </p>
+                  <p
+                    className={`text-base font-semibold ${
+                      isToday(day) ? 'text-primary-600' :
+                      holiday ? 'text-danger-600' : 'text-neutral-800'
+                    }`}
+                  >
+                    {format(day, 'd')}
+                  </p>
+                </div>
+              );
+            })}
           </div>
 
           <div className="relative">
@@ -196,28 +305,26 @@ export default function WeekCalendar({
                   {hour.toString().padStart(2, '0')}:00
                 </div>
                 {weekDays.map((day) => {
-                  const reservation = getReservationForSlot(day, hour);
-                  const isSelected = isSlotSelected(day, hour);
-                  const isPast = isPastHour(day, hour);
+                  const status = getSlotStatus(day, hour);
+                  const slotClass = getSlotClass(status);
+                  const daySched = getDaySchedule(day);
+                  const showOpeningHours = hour === 7 && daySched;
 
                   return (
                     <div
                       key={`${day.toISOString()}-${hour}`}
-                      className={`h-10 border-l border-neutral-50 cursor-pointer transition-colors relative ${
-                        reservation
-                          ? 'bg-primary-100/50 cursor-not-allowed'
-                          : isPast
-                          ? 'bg-neutral-50 cursor-not-allowed'
-                          : isSelected
-                          ? 'bg-primary-500/20'
-                          : 'hover:bg-primary-50'
-                      }`}
-                      onMouseDown={() => !reservation && !isPast && handleSlotMouseDown(day, hour)}
-                      onMouseEnter={() => !reservation && !isPast && handleSlotMouseEnter(day, hour)}
+                      className={`h-10 border-l border-neutral-50 transition-colors relative ${slotClass}`}
+                      onMouseDown={() => handleSlotMouseDown(day, hour)}
+                      onMouseEnter={() => handleSlotMouseEnter(day, hour)}
                     >
-                      {reservation && (
+                      {status === 'reserved' && (
                         <div className="absolute inset-0.5 rounded bg-primary-500 text-white text-xs px-1.5 py-0.5 overflow-hidden">
                           <p className="font-medium truncate">已预约</p>
+                        </div>
+                      )}
+                      {(status === 'closed' || status === 'holiday') && (
+                        <div className="absolute inset-0 flex items-center justify-center">
+                          <Ban className="w-3 h-3 text-neutral-300" />
                         </div>
                       )}
                     </div>
@@ -229,7 +336,7 @@ export default function WeekCalendar({
         </div>
       </div>
 
-      <div className="flex items-center gap-4 p-3 border-t border-neutral-100 bg-neutral-50">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2 p-3 border-t border-neutral-100 bg-neutral-50">
         <div className="flex items-center gap-2">
           <div className="w-3 h-3 rounded bg-white border border-neutral-200" />
           <span className="text-xs text-neutral-500">可预约</span>
@@ -245,6 +352,16 @@ export default function WeekCalendar({
         <div className="flex items-center gap-2">
           <div className="w-3 h-3 rounded bg-neutral-100" />
           <span className="text-xs text-neutral-500">已过期</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <div className="w-3 h-3 rounded bg-neutral-200/80 flex items-center justify-center">
+            <Ban className="w-2 h-2 text-neutral-400" />
+          </div>
+          <span className="text-xs text-neutral-500">未开放</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <div className="w-3 h-3 rounded bg-danger-100" />
+          <span className="text-xs text-neutral-500">节假日</span>
         </div>
       </div>
     </div>

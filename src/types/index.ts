@@ -94,3 +94,45 @@ export interface TimeSlot {
   end: string;
   available: boolean;
 }
+
+export interface DaySchedule {
+  dayOfWeek: number;
+  enabled: boolean;
+  startTime: string;
+  endTime: string;
+}
+
+export interface EquipmentSchedule {
+  equipmentId: string;
+  defaultSchedule: DaySchedule[];
+  exceptions: ScheduleException[];
+}
+
+export interface ScheduleException {
+  id: string;
+  date: string;
+  enabled: boolean;
+  startTime?: string;
+  endTime?: string;
+  reason?: string;
+  type: 'temporary' | 'holiday';
+}
+
+export interface Holiday {
+  id: string;
+  name: string;
+  startDate: string;
+  endDate: string;
+  description?: string;
+}
+
+export interface PersistState {
+  reservations: Reservation[];
+  consumables: Consumable[];
+  consumptionRecords: ConsumptionRecord[];
+  users: User[];
+  notifications: Notification[];
+  equipments: Equipment[];
+  schedules: EquipmentSchedule[];
+  holidays: Holiday[];
+}
