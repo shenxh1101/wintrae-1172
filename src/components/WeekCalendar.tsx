@@ -5,6 +5,8 @@ import {
   Calendar as CalendarIcon,
   Clock,
   Ban,
+  Info,
+  AlertTriangle,
 } from 'lucide-react';
 import {
   startOfWeek,
@@ -30,6 +32,7 @@ interface WeekCalendarProps {
 }
 
 const HOURS = Array.from({ length: 14 }, (_, i) => i + 7);
+const weekDayNames = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
 
 export default function WeekCalendar({
   selectedDate,
@@ -75,8 +78,8 @@ export default function WeekCalendar({
     setCurrentWeekStart(startOfWeek(new Date(), { weekStartsOn: 1 }));
   };
 
-  const isHoliday = (day: Date): boolean => {
-    return holidays.some((h) =>
+  const getHolidayInfo = (day: Date) => {
+    return holidays.find((h) =>
       isWithinInterval(day, {
         start: startOfDay(parseISO(h.startDate)),
         end: endOfDay(parseISO(h.endDate)),
@@ -84,14 +87,33 @@ export default function WeekCalendar({
     );
   };
 
+  const isHoliday = (day: Date): boolean => {
+    return !!getHolidayInfo(day);
+  };
+
+  const getExceptionInfo = (day: Date) => {
+    if (!schedule) return null;
+    const dateStr = format(day, 'yyyy-MM-dd');
+    return schedule.exceptions.find((e) => e.date === dateStr) || null;
+  };
+
   const getDaySchedule = (day: Date) => {
     if (!schedule) return null;
 
-    const dateStr = format(day, 'yyyy-MM-dd');
-    const exception = schedule.exceptions.find((e) => e.date === dateStr);
+    const exception = getExceptionInfo(day);
 
     if (exception) {
-      if (!exception.enabled) return null;
+      if (!exception.enabled) {
+        return {
+          startHour: 0,
+          startMin: 0,
+          endHour: 0,
+          endMin: 0,
+          enabled: false,
+          reason: exception.reason || '临时闭馆',
+          type: 'exception-closed',
+        };
+      }
       if (exception.startTime && exception.endTime) {
         const [startHour, startMin] = exception.startTime.split(':').map(Number);
         const [endHour, endMin] = exception.endTime.split(':').map(Number);
@@ -101,15 +123,39 @@ export default function WeekCalendar({
           endHour,
           endMin,
           enabled: true,
+          reason: exception.reason || '特殊开放',
+          type: 'exception-open',
         };
       }
     }
 
-    if (isHoliday(day)) return null;
+    if (isHoliday(day)) {
+      const holidayInfo = getHolidayInfo(day);
+      return {
+        startHour: 0,
+        startMin: 0,
+        endHour: 0,
+        endMin: 0,
+        enabled: false,
+        reason: holidayInfo?.name || '节假日',
+        description: holidayInfo?.description,
+        type: 'holiday',
+      };
+    }
 
     const dayOfWeek = day.getDay();
     const daySchedule = schedule.defaultSchedule.find((d) => d.dayOfWeek === dayOfWeek);
-    if (!daySchedule || !daySchedule.enabled) return null;
+    if (!daySchedule || !daySchedule.enabled) {
+      return {
+        startHour: 0,
+        startMin: 0,
+        endHour: 0,
+        endMin: 0,
+        enabled: false,
+        reason: `${weekDayNames[dayOfWeek]}不开放`,
+        type: 'weekday-closed',
+      };
+    }
 
     const [startHour, startMin] = daySchedule.startTime.split(':').map(Number);
     const [endHour, endMin] = daySchedule.endTime.split(':').map(Number);
@@ -120,12 +166,56 @@ export default function WeekCalendar({
       endHour,
       endMin,
       enabled: true,
+      type: 'normal',
     };
+  };
+
+  const getDayDisplayInfo = (day: Date) => {
+    const daySched = getDaySchedule(day);
+    const exception = getExceptionInfo(day);
+    const holidayInfo = getHolidayInfo(day);
+
+    let windowText = '';
+    let windowClass = '';
+    let tipText = '';
+    let tipClass = '';
+    let tipIcon = null;
+
+    if (daySched.enabled) {
+      const startStr = `${daySched.startHour.toString().padStart(2, '0')}:${daySched.startMin.toString().padStart(2, '0')}`;
+      const endStr = `${daySched.endHour.toString().padStart(2, '0')}:${daySched.endMin.toString().padStart(2, '0')}`;
+      windowText = `${startStr} - ${endStr}`;
+    } else {
+      windowText = '全天关闭';
+    }
+
+    if (daySched.type === 'normal') {
+      windowClass = 'text-success-600';
+    } else if (daySched.type === 'exception-open') {
+      windowClass = 'text-warning-600';
+      tipText = exception?.reason || '特殊开放时段';
+      tipClass = 'text-warning-600';
+      tipIcon = Info;
+    } else if (daySched.type === 'exception-closed') {
+      windowClass = 'text-danger-500';
+      tipText = exception?.reason || '临时闭馆';
+      tipClass = 'text-danger-600';
+      tipIcon = AlertTriangle;
+    } else if (daySched.type === 'holiday') {
+      windowClass = 'text-danger-500';
+      tipText = holidayInfo?.name || '节假日';
+      tipClass = 'text-danger-600';
+      tipIcon = AlertTriangle;
+    } else {
+      windowClass = 'text-neutral-400';
+    }
+
+    return { windowText, windowClass, tipText, tipClass, tipIcon };
   };
 
   const isWithinOperatingHours = (day: Date, hour: number): boolean => {
     const daySched = getDaySchedule(day);
-    if (!daySched) return false;
+    if (!daySched || !daySched.enabled) return false;
 
     const slotStart = setMinutes(setHours(day, hour), 0);
     const shiftStart = setMinutes(setHours(day, daySched.startHour), daySched.startMin);
@@ -202,10 +292,12 @@ export default function WeekCalendar({
     const isClosed = !isWithinOperatingHours(day, hour);
     const isSelected = isSlotSelected(day, hour);
     const holiday = isHoliday(day);
+    const exception = getExceptionInfo(day);
 
     if (reservation) return 'reserved';
     if (isPast) return 'past';
     if (holiday) return 'holiday';
+    if (exception && !exception.enabled) return 'exception-closed';
     if (isClosed) return 'closed';
     if (isSelected) return 'selected';
     return 'available';
@@ -221,6 +313,8 @@ export default function WeekCalendar({
         return 'bg-neutral-100/80 cursor-not-allowed';
       case 'holiday':
         return 'bg-danger-50 cursor-not-allowed';
+      case 'exception-closed':
+        return 'bg-warning-50 cursor-not-allowed';
       case 'selected':
         return 'bg-primary-500/25';
       default:
@@ -263,16 +357,20 @@ export default function WeekCalendar({
 
       <div className="overflow-x-auto">
         <div className="min-w-[700px]">
+          {/* 日期 + 可约窗口 + 说明 */}
           <div className="grid grid-cols-[60px_repeat(7,1fr)] border-b border-neutral-100">
-            <div className="p-3 text-center text-xs text-neutral-400 font-medium">
-              <Clock className="w-4 h-4 mx-auto" />
+            <div className="p-2 text-center text-xs text-neutral-400 font-medium border-r border-neutral-100">
+              <Clock className="w-4 h-4 mx-auto mb-1" />
+              <span>时间</span>
             </div>
             {weekDays.map((day) => {
               const holiday = isHoliday(day);
+              const info = getDayDisplayInfo(day);
+              const TipIcon = info.tipIcon;
               return (
                 <div
                   key={day.toISOString()}
-                  className={`p-3 text-center border-l border-neutral-100 first:border-l-0 ${
+                  className={`p-2 text-center border-l border-neutral-100 first:border-l-0 ${
                     isToday(day) ? 'bg-primary-50/50' : ''
                   } ${holiday ? 'bg-danger-50/30' : ''}`}
                 >
@@ -280,7 +378,6 @@ export default function WeekCalendar({
                     holiday ? 'text-danger-500' : 'text-neutral-500'
                   }`}>
                     {format(day, 'EEE', { locale: zhCN })}
-                    {holiday && ' · 节假日'}
                   </p>
                   <p
                     className={`text-base font-semibold ${
@@ -290,6 +387,18 @@ export default function WeekCalendar({
                   >
                     {format(day, 'd')}
                   </p>
+                  {/* 可约窗口 */}
+                  <div className={`mt-1 text-[10px] font-medium ${info.windowClass}`}>
+                    {info.windowText}
+                  </div>
+                  {/* 说明提示 */}
+                  {info.tipText && (
+                    <div className={`mt-0.5 text-[10px] flex items-center justify-center gap-0.5 ${info.tipClass}`}
+                      title={info.tipText}>
+                      {TipIcon && <TipIcon className="w-2.5 h-2.5" />}
+                      <span className="truncate max-w-full">{info.tipText}</span>
+                    </div>
+                  )}
                 </div>
               );
             })}
@@ -307,8 +416,6 @@ export default function WeekCalendar({
                 {weekDays.map((day) => {
                   const status = getSlotStatus(day, hour);
                   const slotClass = getSlotClass(status);
-                  const daySched = getDaySchedule(day);
-                  const showOpeningHours = hour === 7 && daySched;
 
                   return (
                     <div
@@ -322,9 +429,13 @@ export default function WeekCalendar({
                           <p className="font-medium truncate">已预约</p>
                         </div>
                       )}
-                      {(status === 'closed' || status === 'holiday') && (
+                      {(status === 'closed' || status === 'holiday' || status === 'exception-closed') && (
                         <div className="absolute inset-0 flex items-center justify-center">
-                          <Ban className="w-3 h-3 text-neutral-300" />
+                          <Ban className={`w-3 h-3 ${
+                            status === 'holiday' ? 'text-danger-300' :
+                            status === 'exception-closed' ? 'text-warning-300' :
+                            'text-neutral-300'
+                          }`} />
                         </div>
                       )}
                     </div>
@@ -362,6 +473,10 @@ export default function WeekCalendar({
         <div className="flex items-center gap-2">
           <div className="w-3 h-3 rounded bg-danger-100" />
           <span className="text-xs text-neutral-500">节假日</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <div className="w-3 h-3 rounded bg-warning-100" />
+          <span className="text-xs text-neutral-500">临时闭馆</span>
         </div>
       </div>
     </div>

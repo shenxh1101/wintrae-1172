@@ -80,7 +80,7 @@ interface AppState {
   setFilterStartTime: (time: string) => void;
   setFilterEndTime: (time: string) => void;
 
-  addReservation: (data: Omit<Reservation, 'id' | 'status' | 'createdAt'>) => void;
+  addReservation: (data: Omit<Reservation, 'id' | 'status' | 'createdAt'>) => string;
   updateReservation: (id: string, data: Partial<Reservation>) => void;
   modifyReservation: (id: string, startTime: string, endTime: string, purpose?: string, participants?: string) => boolean;
   cancelReservation: (id: string) => void;
@@ -99,6 +99,7 @@ interface AppState {
 
   updateEquipmentSchedule: (equipmentId: string, schedule: Partial<EquipmentSchedule>) => void;
   addScheduleException: (equipmentId: string, exception: Omit<import('@/types').ScheduleException, 'id'>) => void;
+  updateScheduleException: (equipmentId: string, exceptionId: string, data: Partial<Omit<import('@/types').ScheduleException, 'id'>>) => void;
   removeScheduleException: (equipmentId: string, exceptionId: string) => void;
   addHoliday: (holiday: Omit<Holiday, 'id'>) => void;
   removeHoliday: (id: string) => void;
@@ -345,6 +346,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       reservations: [...state.reservations, newReservation],
     }));
     get().persist();
+    return newReservation.id;
   },
 
   updateReservation: (id: string, data: Partial<Reservation>) => {
@@ -511,11 +513,37 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   addScheduleException: (equipmentId: string, exception: Omit<import('@/types').ScheduleException, 'id'>) => {
     set((state) => ({
+      schedules: state.schedules.map((s) => {
+        if (s.equipmentId !== equipmentId) return s;
+        // 检查同一天是否已存在例外，存在则覆盖（upsert）
+        const existingIdx = s.exceptions.findIndex((e) => e.date === exception.date);
+        if (existingIdx >= 0) {
+          const updated = [...s.exceptions];
+          updated[existingIdx] = {
+            ...updated[existingIdx],
+            ...exception,
+          };
+          return { ...s, exceptions: updated };
+        }
+        // 不存在则新增
+        return {
+          ...s,
+          exceptions: [...s.exceptions, { ...exception, id: generateId('ex') }],
+        };
+      }),
+    }));
+    get().persist();
+  },
+
+  updateScheduleException: (equipmentId: string, exceptionId: string, data: Partial<Omit<import('@/types').ScheduleException, 'id'>>) => {
+    set((state) => ({
       schedules: state.schedules.map((s) =>
         s.equipmentId === equipmentId
           ? {
               ...s,
-              exceptions: [...s.exceptions, { ...exception, id: generateId('ex') }],
+              exceptions: s.exceptions.map((e) =>
+                e.id === exceptionId ? { ...e, ...data } : e
+              ),
             }
           : s
       ),

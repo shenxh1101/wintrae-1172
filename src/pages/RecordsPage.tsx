@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import {
   Clock,
   MapPin,
@@ -69,15 +69,63 @@ export default function RecordsPage() {
     setModifyDate(format(start, 'yyyy-MM-dd'));
     setModifyStartTime(format(start, 'HH:mm'));
     setModifyEndTime(format(end, 'HH:mm'));
-    setModifyPurpose(reservation.purpose);
+    setModifyPurpose(reservation.purpose || '');
     setModifyParticipants(reservation.participants || '');
     setModifyError('');
     setShowModifyModal(true);
   };
 
-  const validateModify = (): boolean => {
-    setModifyError('');
+  // 实时校验：日期/时间一有变化就立刻校验
+  useEffect(() => {
+    if (!showModifyModal || !modifyReservation) return;
 
+    if (!modifyDate || !modifyStartTime || !modifyEndTime) {
+      setModifyError('');
+      return;
+    }
+
+    const startDateTime = parseISO(`${modifyDate}T${modifyStartTime}`);
+    const endDateTime = parseISO(`${modifyDate}T${modifyEndTime}`);
+
+    // 1. 结束时间必须晚于开始时间
+    if (endDateTime <= startDateTime) {
+      setModifyError('结束时间必须晚于开始时间');
+      return;
+    }
+
+    // 2. 不能早于当前时间
+    if (startDateTime < new Date()) {
+      setModifyError('预约时间不能早于当前时间');
+      return;
+    }
+
+    // 3. 检查开放时间
+    const inOperatingHours = isWithinOperatingHours(
+      modifyReservation.equipmentId,
+      startDateTime.toISOString(),
+      endDateTime.toISOString()
+    );
+    if (!inOperatingHours) {
+      setModifyError('所选时段不在设备开放时间内（含节假日或临时闭馆）');
+      return;
+    }
+
+    // 4. 检查冲突
+    const available = isSlotAvailable(
+      modifyReservation.equipmentId,
+      startDateTime.toISOString(),
+      endDateTime.toISOString(),
+      modifyReservation.id
+    );
+    if (!available) {
+      setModifyError('所选时段与其他预约冲突');
+      return;
+    }
+
+    setModifyError('');
+  }, [showModifyModal, modifyDate, modifyStartTime, modifyEndTime, modifyReservation]);
+
+  const validateModify = (): boolean => {
     if (!modifyDate || !modifyStartTime || !modifyEndTime) {
       setModifyError('请选择完整的预约日期和时间');
       return false;
@@ -103,7 +151,7 @@ export default function RecordsPage() {
         endDateTime.toISOString()
       );
       if (!inOperatingHours) {
-        setModifyError('所选时段不在设备开放时间内');
+        setModifyError('所选时段不在设备开放时间内（含节假日或临时闭馆）');
         return false;
       }
 
@@ -132,8 +180,8 @@ export default function RecordsPage() {
       modifyReservation.id,
       startDateTime.toISOString(),
       endDateTime.toISOString(),
-      modifyPurpose,
-      modifyParticipants || undefined
+      modifyPurpose.trim() || modifyReservation.purpose,
+      modifyParticipants.trim() || modifyReservation.participants
     );
 
     setShowModifyModal(false);

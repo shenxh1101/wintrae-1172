@@ -13,6 +13,7 @@ import {
   Plus,
   Trash2,
   Eye,
+  Edit3,
   Settings,
   CalendarOff,
   Calendar,
@@ -52,6 +53,7 @@ export default function AdminPage() {
     updateEquipmentStatus,
     updateEquipmentSchedule,
     addScheduleException,
+    updateScheduleException,
     removeScheduleException,
     addHoliday,
     removeHoliday,
@@ -75,6 +77,9 @@ export default function AdminPage() {
   const [showScheduleModal, setShowScheduleModal] = useState(false);
   const [editingEquipmentId, setEditingEquipmentId] = useState<string | null>(null);
   const [editingSchedule, setEditingSchedule] = useState<DaySchedule[]>([]);
+
+  // 例外日期弹窗 - 支持编辑模式
+  const [editingExceptionId, setEditingExceptionId] = useState<string | null>(null);
   const [showExceptionModal, setShowExceptionModal] = useState(false);
   const [exceptionEquipmentId, setExceptionEquipmentId] = useState<string | null>(null);
   const [exceptionDate, setExceptionDate] = useState('');
@@ -116,6 +121,7 @@ export default function AdminPage() {
 
   const openExceptionModal = (equipmentId: string) => {
     setExceptionEquipmentId(equipmentId);
+    setEditingExceptionId(null);
     setExceptionDate('');
     setExceptionEnabled(false);
     setExceptionStartTime('');
@@ -124,18 +130,43 @@ export default function AdminPage() {
     setShowExceptionModal(true);
   };
 
+  const openEditExceptionModal = (equipmentId: string, exceptionId: string) => {
+    const schedule = getScheduleByEquipment(equipmentId);
+    const exception = schedule.exceptions.find((e) => e.id === exceptionId);
+    if (!exception) return;
+
+    setExceptionEquipmentId(equipmentId);
+    setEditingExceptionId(exceptionId);
+    setExceptionDate(exception.date);
+    setExceptionEnabled(exception.enabled);
+    setExceptionStartTime(exception.startTime || '');
+    setExceptionEndTime(exception.endTime || '');
+    setExceptionReason(exception.reason || '');
+    setShowExceptionModal(true);
+  };
+
   const handleAddException = () => {
     if (!exceptionEquipmentId || !exceptionDate) return;
 
-    addScheduleException(exceptionEquipmentId, {
+    const data = {
       date: exceptionDate,
       enabled: exceptionEnabled,
       startTime: exceptionStartTime || undefined,
       endTime: exceptionEndTime || undefined,
       reason: exceptionReason || undefined,
-      type: 'temporary',
-    });
+      type: 'temporary' as const,
+    };
+
+    if (editingExceptionId) {
+      // 编辑模式：更新已有例外
+      updateScheduleException(exceptionEquipmentId, editingExceptionId, data);
+    } else {
+      // 新增模式：同日自动覆盖
+      addScheduleException(exceptionEquipmentId, data);
+    }
+
     setShowExceptionModal(false);
+    setEditingExceptionId(null);
   };
 
   const handleAddHoliday = () => {
@@ -529,6 +560,7 @@ export default function AdminPage() {
                             className="select min-w-[120px] text-sm"
                           >
                             <option value="available">正常开放</option>
+                            <option value="in-use">使用中</option>
                             <option value="maintenance">维护中</option>
                             <option value="disabled">已停用</option>
                           </select>
@@ -557,7 +589,7 @@ export default function AdminPage() {
                             {schedule.exceptions.map((exc) => (
                               <div
                                 key={exc.id}
-                                className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs ${
+                                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs group ${
                                   exc.enabled
                                     ? 'bg-success-50 text-success-700 border border-success-200'
                                     : 'bg-danger-50 text-danger-700 border border-danger-200'
@@ -565,10 +597,18 @@ export default function AdminPage() {
                               >
                                 <Calendar className="w-3 h-3" />
                                 <span>{exc.date}</span>
-                                {exc.reason && <span>· {exc.reason}</span>}
+                                {exc.reason && <span className="opacity-75">· {exc.reason}</span>}
+                                <button
+                                  onClick={() => openEditExceptionModal(eq.id, exc.id)}
+                                  className="p-0.5 rounded-full opacity-0 group-hover:opacity-100 hover:bg-white/70 transition-all"
+                                  title="编辑"
+                                >
+                                  <Edit3 className="w-3 h-3" />
+                                </button>
                                 <button
                                   onClick={() => removeScheduleException(eq.id, exc.id)}
                                   className="p-0.5 rounded-full hover:bg-white/50 transition-colors"
+                                  title="删除"
                                 >
                                   <X className="w-3 h-3" />
                                 </button>
@@ -1331,11 +1371,13 @@ export default function AdminPage() {
       <Modal
         isOpen={showExceptionModal}
         onClose={() => setShowExceptionModal(false)}
-        title="添加例外日期"
+        title={editingExceptionId ? '编辑例外日期' : '添加例外日期'}
       >
         <div className="space-y-4">
           <p className="text-sm text-neutral-500">
-            设置单日的特殊开放安排，优先级高于周时间表
+            {editingExceptionId
+              ? '修改该日期的特殊开放安排，同日规则会自动覆盖更新'
+              : '设置单日的特殊开放安排，优先级高于周时间表，同日重复添加会自动覆盖'}
           </p>
 
           <div>
@@ -1347,7 +1389,8 @@ export default function AdminPage() {
               value={exceptionDate}
               onChange={(e) => setExceptionDate(e.target.value)}
               min={format(new Date(), 'yyyy-MM-dd')}
-              className="input"
+              disabled={!!editingExceptionId}
+              className={`input ${editingExceptionId ? 'bg-neutral-50 text-neutral-500 cursor-not-allowed' : ''}`}
             />
           </div>
 
@@ -1419,7 +1462,13 @@ export default function AdminPage() {
           </div>
 
           <div className="flex justify-end gap-3 pt-2">
-            <button onClick={() => setShowExceptionModal(false)} className="btn-secondary">
+            <button
+              onClick={() => {
+                setShowExceptionModal(false);
+                setEditingExceptionId(null);
+              }}
+              className="btn-secondary"
+            >
               取消
             </button>
             <button
@@ -1427,7 +1476,7 @@ export default function AdminPage() {
               disabled={!exceptionDate}
               className="btn-primary"
             >
-              添加
+              {editingExceptionId ? '保存修改' : '添加'}
             </button>
           </div>
         </div>
